@@ -119,7 +119,6 @@ if WATCHDOG_AVAILABLE:
             self.wait()
 
 
-# --- Custom Modern Dashboard Theme ---
 DASHBOARD_STYLESHEET = """
 QMainWindow {
     background-color: #12131C;
@@ -131,7 +130,6 @@ QWidget {
     font-size: 13px;
 }
 
-/* Purple Left Navigation Sidebar */
 #SidebarFrame {
     background-color: #6C5CE7;
     border-top-right-radius: 20px;
@@ -153,13 +151,6 @@ QWidget {
     color: #FFFFFF;
 }
 
-#NavButton:checked {
-    background-color: #12131C;
-    color: #6C5CE7;
-    font-weight: bold;
-}
-
-/* Card Containers */
 #DashboardCard {
     background-color: #1E1F2E;
     border-radius: 16px;
@@ -167,7 +158,6 @@ QWidget {
     border: 1px solid #28293D;
 }
 
-/* Primary Action Buttons */
 QPushButton#PrimaryBtn {
     background-color: #6C5CE7;
     color: #FFFFFF;
@@ -194,7 +184,6 @@ QPushButton#DangerBtn:hover {
     background-color: #FF5252;
 }
 
-/* Form Inputs & Lists */
 QLineEdit, QComboBox, QSpinBox, QListWidget, QTextEdit {
     background-color: #171824;
     border: 1px solid #2B2C42;
@@ -214,7 +203,6 @@ QListWidget::item:selected {
     color: #FFFFFF;
 }
 
-/* Smooth Rounded Progress Bar */
 QProgressBar {
     border: none;
     border-radius: 8px;
@@ -227,6 +215,15 @@ QProgressBar {
 QProgressBar::chunk {
     background-color: #00B894;
     border-radius: 8px;
+}
+
+QToolTip {
+    background-color: #1E1F2E;
+    color: #FFFFFF;
+    border: 1px solid #6C5CE7;
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 12px;
 }
 """
 
@@ -549,7 +546,6 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 16, 16)
         main_layout.setSpacing(16)
 
-        # ---------------- 1. Left Purple Sidebar ----------------
         sidebar_frame = QFrame()
         sidebar_frame.setObjectName("SidebarFrame")
         sidebar_frame.setFixedWidth(80)
@@ -581,7 +577,6 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(sidebar_frame)
 
-        # ---------------- 2. Main Content Area ----------------
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(10, 20, 10, 10)
 
@@ -589,7 +584,6 @@ class MainWindow(QMainWindow):
         header_lbl.setStyleSheet("font-size: 24px; font-weight: bold; color: #FFFFFF; margin-bottom: 10px;")
         content_layout.addWidget(header_lbl)
 
-        # Metric Cards Header Row
         metrics_row = QHBoxLayout()
 
         card1 = QFrame()
@@ -627,10 +621,8 @@ class MainWindow(QMainWindow):
 
         content_layout.addLayout(metrics_row)
 
-        # Main Split Section (Left: Job List | Right: Controls + Action Output)
         split_layout = QHBoxLayout()
 
-        # Jobs Column Card
         jobs_card = QFrame()
         jobs_card.setObjectName("DashboardCard")
         jc_box = QVBoxLayout(jobs_card)
@@ -663,7 +655,6 @@ class MainWindow(QMainWindow):
 
         split_layout.addWidget(jobs_card, 1)
 
-        # Dashboard Controls & Execution Log Card
         dash_card = QFrame()
         dash_card.setObjectName("DashboardCard")
         dc_box = QVBoxLayout(dash_card)
@@ -678,6 +669,13 @@ class MainWindow(QMainWindow):
 
         ctrl_row = QHBoxLayout()
         self.dry_run_cb = QCheckBox("Dry-Run Mode (Simulation)")
+        
+        # --- Hover Tooltip for Dry-Run Mode ---
+        self.dry_run_cb.setToolTip(
+            "<b>Simulation Mode:</b><br>"
+            "Scans drives and logs planned file copies or deletions without making any actual changes to your disk.<br>"
+            "Use this to safely test sync rules before executing live updates."
+        )
         ctrl_row.addWidget(self.dry_run_cb)
 
         self.run_btn = QPushButton("▶ Run Selected Job")
