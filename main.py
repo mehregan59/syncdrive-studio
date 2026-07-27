@@ -52,7 +52,8 @@ from PyQt6.QtWidgets import (
     QListWidget, QPushButton, QLabel, QTextEdit, QCheckBox, QComboBox,
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
     QProgressBar, QFileDialog, QGroupBox, QRadioButton, QSpinBox, QFrame,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QSplitter, QSystemTrayIcon, QMenu
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QSplitter, QSystemTrayIcon, QMenu,
+    QStyle
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
 from PyQt6.QtGui import QIcon, QColor, QAction
@@ -184,7 +185,7 @@ QPushButton#RibbonBtnPrimary:hover {
 }
 
 #PathCard {
-    background-color: #1E1F2E;
+    background-color: #1E1E1E;
     border: 1px solid #2B2C42;
     border-radius: 8px;
     padding: 4px 10px;
@@ -689,7 +690,7 @@ class MainWindow(QMainWindow):
             self.tray_icon.setIcon(QIcon(str(icon_path)))
             self.setWindowIcon(QIcon(str(icon_path)))
         else:
-            self.tray_icon.setIcon(self.style().standardIcon(QApplication.Style().SP_DriveHDIcon))
+            self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon))
 
         tray_menu = QMenu()
         show_action = QAction("Open SyncDrive Studio", self)
