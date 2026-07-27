@@ -1,8 +1,9 @@
 import sys
 import subprocess
 import importlib.util
+import multiprocessing
 
-# List of required packages mapped to their import names
+# List of required packages mapped to their import names (used when running from source)
 REQUIRED_PACKAGES = {
     "PyQt6": "PyQt6",
     "pydantic": "pydantic",
@@ -10,7 +11,7 @@ REQUIRED_PACKAGES = {
 }
 
 def auto_install_dependencies():
-    """Checks for required packages and auto-installs missing ones via pip."""
+    """Checks for required packages and auto-installs missing ones via pip if running from source."""
     missing = []
     for pkg_name, import_name in REQUIRED_PACKAGES.items():
         if importlib.util.find_spec(import_name) is None:
@@ -27,10 +28,10 @@ def auto_install_dependencies():
             print(f"Failed to auto-install dependencies: {e}")
             sys.exit(1)
 
-# Run the auto-installer BEFORE attempting imports of 3rd party libraries
-auto_install_dependencies()
+# Only auto-install dependencies if running as raw script (not inside compiled .exe)
+if not getattr(sys, 'frozen', False):
+    auto_install_dependencies()
 
-# --- Normal Application Imports ---
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QLabel, QTextEdit, QCheckBox, QComboBox,
@@ -89,7 +90,7 @@ class JobDialog(QDialog):
     def get_job(self) -> SyncJob:
         sources = [s.strip() for s in self.sources_input.text().split(",") if s.strip()]
         targets = [t.strip() for t in self.targets_input.text().split(",") if t.strip()]
-        
+
         return SyncJob(
             id=self.job.id if self.job else None,
             name=self.name_input.text().strip(),
@@ -251,6 +252,9 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Prevents PyInstaller from spawning infinite processes on Windows
+    multiprocessing.freeze_support()
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
