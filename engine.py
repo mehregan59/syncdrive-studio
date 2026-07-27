@@ -39,7 +39,7 @@ class SyncEngine:
         return "SKIP"
 
     def plan_job(self, job: SyncJob) -> List[SyncAction]:
-        """Calculates the exact actions to take without modifying any files (Dry-Run mode)."""
+        """Calculates exact execution actions without modifying files (Dry-Run / Plan)."""
         actions: List[SyncAction] = []
 
         for src_str in job.sources:
@@ -52,7 +52,7 @@ class SyncEngine:
                 if not dst_root.exists():
                     continue
 
-                # 1. Check Source -> Target files
+                # 1. Source -> Target sync check
                 for root, _, files in os.walk(src_root):
                     rel_path = Path(root).relative_to(src_root)
                     dst_dir = dst_root / rel_path
@@ -84,7 +84,7 @@ class SyncEngine:
                                         reason=f"Conflict resolved via policy: {job.conflict_policy.value}"
                                     ))
 
-                # 2. Check Target -> Source files (For Two-Way Sync)
+                # 2. Target -> Source sync check (Two-Way Sync)
                 if job.mode == SyncMode.TWO_WAY_SYNC:
                     for root, _, files in os.walk(dst_root):
                         rel_path = Path(root).relative_to(dst_root)
@@ -105,7 +105,7 @@ class SyncEngine:
                                     reason="File missing in source (Two-Way Sync)"
                                 ))
 
-                # 3. Handle Extra Target Files (For One-Way Mirror)
+                # 3. Handle Extra Target Files (One-Way Mirror Mode)
                 elif job.mode == SyncMode.ONE_WAY_MIRROR:
                     for root, _, files in os.walk(dst_root):
                         rel_path = Path(root).relative_to(dst_root)
