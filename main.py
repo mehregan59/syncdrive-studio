@@ -83,13 +83,19 @@ if WATCHDOG_AVAILABLE:
             self.last_event_time = 0
 
         def _handle_event(self, event_type: str, src_path: str):
-            if "$RECYCLE.BIN" in src_path or src_path.endswith(".tmp") or src_path.endswith("~"):
-                return
-            current_time = time.time()
-            if current_time - self.last_event_time > self.debounce_seconds:
-                self.last_event_time = current_time
-                filename = os.path.basename(src_path) or src_path
-                self.bridge.file_changed.emit(event_type, filename)
+            try:
+                # System files filter to prevent C-level thread crashes on drive roots
+                ignored_keywords = ["$RECYCLE.BIN", "System Volume Information", ".tmp", "~", "desktop.ini"]
+                if any(kw in src_path for kw in ignored_keywords):
+                    return
+                
+                current_time = time.time()
+                if current_time - self.last_event_time > self.debounce_seconds:
+                    self.last_event_time = current_time
+                    filename = os.path.basename(src_path) or src_path
+                    self.bridge.file_changed.emit(event_type, filename)
+            except Exception:
+                pass
 
         def on_created(self, event):
             self._handle_event("Created", event.src_path)
@@ -102,7 +108,8 @@ if WATCHDOG_AVAILABLE:
             self._handle_event("Deleted", event.src_path)
 
         def on_moved(self, event):
-            self._handle_event("Renamed", event.dest_path)
+            dest = getattr(event, 'dest_path', event.src_path)
+            self._handle_event("Renamed", dest)
 
     class SmartFolderWatcherManager:
         def __init__(self, watch_paths: List[str], callback: Callable[[str, str], None], debounce_seconds: int = 1):
@@ -152,8 +159,8 @@ QPushButton#RibbonBtn {
     background-color: #28293D;
     color: #FFFFFF;
     border: 1px solid #3B3C54;
-    border-radius: 8px;
-    padding: 7px 14px;
+    border-radius: 6px;
+    padding: 6px 12px;
     font-weight: bold;
     font-size: 12px;
 }
@@ -167,8 +174,8 @@ QPushButton#RibbonBtnPrimary {
     background-color: #6C5CE7;
     color: #FFFFFF;
     border: none;
-    border-radius: 8px;
-    padding: 7px 16px;
+    border-radius: 6px;
+    padding: 6px 14px;
     font-weight: bold;
     font-size: 12px;
 }
@@ -177,17 +184,36 @@ QPushButton#RibbonBtnPrimary:hover {
     background-color: #7D6EEB;
 }
 
+QPushButton#StopBtn {
+    background-color: #E74C3C;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-weight: bold;
+    font-size: 12px;
+}
+
+QPushButton#StopBtn:hover {
+    background-color: #FF5252;
+}
+
+QPushButton#StopBtn:disabled {
+    background-color: #333344;
+    color: #666677;
+}
+
 /* Compact Connection Header Bar */
 #ConnectionHeader {
     background-color: #171824;
     border-bottom: 1px solid #28293D;
-    padding: 6px 16px;
+    padding: 6px 12px;
 }
 
 #PathCard {
-    background-color: #1E1E1E;
+    background-color: #1E1F2E;
     border: 1px solid #2B2C42;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 4px 10px;
 }
 
@@ -195,7 +221,7 @@ QPushButton#RibbonBtnPrimary:hover {
 QTreeWidget, QListWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox {
     background-color: #171824;
     border: 1px solid #2B2C42;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 4px;
     color: #FFFFFF;
 }
@@ -380,6 +406,10 @@ class SyncWorker(QThread):
         self.engine = engine
         self.job = job
         self.dry_run = dry_run
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
 
     def run(self):
         try:
@@ -390,6 +420,10 @@ class SyncWorker(QThread):
                 self.progress_update.emit(100, "No pending file changes detected.")
 
             for idx, action in enumerate(actions, 1):
+                if self.stop_requested:
+                    self.progress_update.emit(0, "🛑 Sync operation cancelled by user.")
+                    break
+
                 pct = int((idx / total) * 100) if total > 0 else 100
                 msg = f"[{action.action_type}] {action.target_path or action.source_path}"
 
@@ -538,6 +572,7 @@ class MainWindow(QMainWindow):
         self.config_dir = config_dir
         self.install_dir = install_dir
         self.force_quit = False
+        self.worker = None
         self.setWindowTitle(f"SyncDrive Studio [{self.app_mode.value.upper()}]")
         self.resize(1150, 720)
         self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
@@ -567,10 +602,11 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 1. Top Ribbon Toolbar
+        # 1. Compact Top Ribbon Toolbar
         toolbar = QFrame()
         toolbar.setObjectName("ToolbarFrame")
         tb_layout = QHBoxLayout(toolbar)
+        tb_layout.setContentsMargins(8, 4, 8, 4)
 
         btn_new = QPushButton("➕ New Job")
         btn_new.setObjectName("RibbonBtn")
@@ -587,7 +623,7 @@ class MainWindow(QMainWindow):
         btn_del.clicked.connect(self.delete_job)
         tb_layout.addWidget(btn_del)
 
-        tb_layout.addSpacing(20)
+        tb_layout.addSpacing(15)
 
         self.btn_analyze = QPushButton("🔍 Analyze (Preview)")
         self.btn_analyze.setObjectName("RibbonBtnPrimary")
@@ -600,16 +636,35 @@ class MainWindow(QMainWindow):
         self.btn_sync.clicked.connect(lambda: self.run_job(force_dry_run=False))
         tb_layout.addWidget(self.btn_sync)
 
-        tb_layout.addSpacing(20)
+        self.btn_stop = QPushButton("🛑 Stop")
+        self.btn_stop.setObjectName("StopBtn")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_current_job)
+        tb_layout.addWidget(self.btn_stop)
 
-        self.dry_run_cb = QCheckBox("Dry-Run Check")
+        tb_layout.addSpacing(15)
+
+        # Fast Schedule Selector Bar
+        tb_layout.addWidget(QLabel("Trigger:"))
+        self.quick_schedule_combo = QComboBox()
+        self.quick_schedule_combo.addItems([s.value for s in ScheduleType])
+        self.quick_schedule_combo.currentTextChanged.connect(self.on_quick_schedule_changed)
+        tb_layout.addWidget(self.quick_schedule_combo)
+
+        self.quick_interval_spin = QSpinBox()
+        self.quick_interval_spin.setRange(1, 1440)
+        self.quick_interval_spin.setSuffix("m")
+        self.quick_interval_spin.valueChanged.connect(self.on_quick_interval_changed)
+        tb_layout.addWidget(self.quick_interval_spin)
+
+        self.dry_run_cb = QCheckBox("Dry-Run")
         self.dry_run_cb.setToolTip("Scans drive differences without performing file changes.")
         tb_layout.addWidget(self.dry_run_cb)
 
         tb_layout.addStretch()
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(180)
+        self.progress_bar.setFixedWidth(160)
         self.progress_bar.setFixedHeight(18)
         tb_layout.addWidget(self.progress_bar)
 
@@ -618,27 +673,27 @@ class MainWindow(QMainWindow):
         # 2. Compact Source <-> Target Header Bar
         conn_frame = QFrame()
         conn_frame.setObjectName("ConnectionHeader")
-        conn_frame.setFixedHeight(48)
+        conn_frame.setFixedHeight(40)
         conn_layout = QHBoxLayout(conn_frame)
-        conn_layout.setContentsMargins(12, 4, 12, 4)
+        conn_layout.setContentsMargins(10, 2, 10, 2)
 
         src_card = QFrame()
         src_card.setObjectName("PathCard")
         src_c_layout = QHBoxLayout(src_card)
-        src_c_layout.setContentsMargins(8, 2, 8, 2)
+        src_c_layout.setContentsMargins(6, 2, 6, 2)
         self.src_lbl = QLabel("📁 Source: (Select a job)")
         self.src_lbl.setStyleSheet("font-weight: bold; color: #00ADB5;")
         src_c_layout.addWidget(self.src_lbl)
         conn_layout.addWidget(src_card, 1)
 
         arrow_lbl = QLabel(" ↔ ")
-        arrow_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #6C5CE7;")
+        arrow_lbl.setStyleSheet("font-size: 14px; font-weight: bold; color: #6C5CE7;")
         conn_layout.addWidget(arrow_lbl, 0, Qt.AlignmentFlag.AlignCenter)
 
         dst_card = QFrame()
         dst_card.setObjectName("PathCard")
         dst_c_layout = QHBoxLayout(dst_card)
-        dst_c_layout.setContentsMargins(8, 2, 8, 2)
+        dst_c_layout.setContentsMargins(6, 2, 6, 2)
         self.dst_lbl = QLabel("💾 Target: (Select a job)")
         self.dst_lbl.setStyleSheet("font-weight: bold; color: #00B894;")
         dst_c_layout.addWidget(self.dst_lbl)
@@ -646,15 +701,24 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(conn_frame)
 
-        # 3. Splitter View
+        # 3. Main Splitter View (No vast empty space)
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left Panel: Job Tree
+        # Left Panel: Job Tree & Status Badge
+        left_widget = QWidget()
+        left_box = QVBoxLayout(left_widget)
+        left_box.setContentsMargins(4, 4, 4, 4)
+
+        self.watcher_status_lbl = QLabel("👁️ Live Auto-Sync: Idle")
+        self.watcher_status_lbl.setStyleSheet("color: #00B894; font-weight: bold; padding: 2px;")
+        left_box.addWidget(self.watcher_status_lbl)
+
         self.job_tree = QTreeWidget()
-        self.job_tree.setHeaderLabel("All Sync Jobs")
-        self.job_tree.setFixedWidth(220)
+        self.job_tree.setHeaderLabel("All Sync Tasks")
         self.job_tree.currentItemChanged.connect(self.on_job_tree_selected)
-        splitter.addWidget(self.job_tree)
+        left_box.addWidget(self.job_tree)
+
+        splitter.addWidget(left_widget)
 
         # Right Panel: Diff Comparison View + Realtime Log Output
         right_container = QWidget()
@@ -668,15 +732,19 @@ class MainWindow(QMainWindow):
         self.diff_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.diff_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.diff_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        rc_layout.addWidget(self.diff_tree)
+        rc_layout.addWidget(self.diff_tree, 2)
+
+        log_header = QLabel("Real-Time Change Log & Sync Activity")
+        log_header.setStyleSheet("color: #8E8EA8; font-weight: bold; margin-top: 4px;")
+        rc_layout.addWidget(log_header)
 
         self.log_output = QTextEdit()
-        self.log_output.setFixedHeight(120)
+        self.log_output.setFixedHeight(140)
         self.log_output.setReadOnly(True)
-        rc_layout.addWidget(self.log_output)
+        rc_layout.addWidget(self.log_output, 1)
 
         splitter.addWidget(right_container)
-        splitter.setSizes([220, 930])
+        splitter.setSizes([230, 920])
 
         layout.addWidget(splitter)
         self.setCentralWidget(main_widget)
@@ -724,7 +792,6 @@ class MainWindow(QMainWindow):
                 self.show_normal_and_raise()
 
     def changeEvent(self, event):
-        """Catch window minimization and redirect to system tray."""
         if event.type() == event.Type.WindowStateChange:
             if self.windowState() & Qt.WindowState.WindowMinimized:
                 QTimer.singleShot(0, self.hide)
@@ -770,7 +837,30 @@ class MainWindow(QMainWindow):
             dst_str = ", ".join(job.targets) if job.targets else "None"
             self.src_lbl.setText(f"📁 Source: {src_str}")
             self.dst_lbl.setText(f"💾 Target: {dst_str}")
+
+            # Sync quick toolbar widgets without infinite loop
+            self.quick_schedule_combo.blockSignals(True)
+            self.quick_interval_spin.blockSignals(True)
+            self.quick_schedule_combo.setCurrentText(job.schedule_type.value)
+            self.quick_interval_spin.setValue(job.interval_minutes)
+            self.quick_interval_spin.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
+            self.quick_schedule_combo.blockSignals(False)
+            self.quick_interval_spin.blockSignals(False)
+
             self.log_output.append(f"ℹ️ Selected task: '{job.name}' [{job.mode.value}]")
+
+    def on_quick_schedule_changed(self, schedule_val: str):
+        job = self.get_selected_job()
+        if job:
+            job.schedule_type = ScheduleType(schedule_val)
+            self.quick_interval_spin.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
+            self.init_timers_and_smart_watchers()
+
+    def on_quick_interval_changed(self, interval_val: int):
+        job = self.get_selected_job()
+        if job:
+            job.interval_minutes = interval_val
+            self.init_timers_and_smart_watchers()
 
     def add_job(self):
         dialog = ModernJobDialog(self)
@@ -815,6 +905,8 @@ class MainWindow(QMainWindow):
             w.stop()
         self.smart_watchers.clear()
 
+        active_watchers_count = 0
+
         for job in self.jobs:
             if not job.is_active:
                 continue
@@ -833,10 +925,18 @@ class MainWindow(QMainWindow):
                     watcher = SmartFolderWatcherManager(valid_paths, callback=callback_slot, debounce_seconds=job.debounce_seconds)
                     watcher.start()
                     self.smart_watchers.append(watcher)
+                    active_watchers_count += 1
                     self.log_output.append(f"👁️ Real-time Watcher Active: '{job.name}' monitoring {len(valid_paths)} folder(s)")
 
+        if active_watchers_count > 0:
+            self.watcher_status_lbl.setText(f"👁️ Auto-Sync Active ({active_watchers_count} Task[s])")
+            self.watcher_status_lbl.setStyleSheet("color: #00B894; font-weight: bold;")
+        else:
+            self.watcher_status_lbl.setText("👁️ Auto-Sync: Idle")
+            self.watcher_status_lbl.setStyleSheet("color: #8E8EA8; font-weight: normal;")
+
     def on_smart_change(self, job: SyncJob, event_type: str, filename: str):
-        self.log_output.append(f"🔔 Realtime Event: [{event_type}] '{filename}' in job '{job.name}' -> Syncing...")
+        self.log_output.append(f"🔔 Realtime Event: [{event_type}] '{filename}' in '{job.name}' -> Auto Syncing...")
         self.execute_job_instance(job, dry_run=False)
 
     def on_drive_plugged_in(self, mountpoint: str):
@@ -846,6 +946,11 @@ class MainWindow(QMainWindow):
                 if any(mountpoint in t for t in job.targets):
                     self.execute_job_instance(job, dry_run=False)
 
+    def stop_current_job(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.log_output.append("🛑 Stopping job execution...")
+
     def run_job(self, force_dry_run: bool = False):
         job = self.get_selected_job()
         if job:
@@ -853,8 +958,12 @@ class MainWindow(QMainWindow):
             self.execute_job_instance(job, dry_run=is_dry)
 
     def execute_job_instance(self, job: SyncJob, dry_run: bool):
+        if self.worker and self.worker.isRunning():
+            return  # Prevent overlapping runs
+
         self.btn_analyze.setEnabled(False)
         self.btn_sync.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.progress_bar.setValue(0)
         self.diff_tree.clear()
 
@@ -883,6 +992,7 @@ class MainWindow(QMainWindow):
     def on_sync_finished(self, actions):
         self.btn_analyze.setEnabled(True)
         self.btn_sync.setEnabled(True)
+        self.btn_stop.setEnabled(False)
         self.progress_bar.setValue(100)
         self.log_output.append(f"✅ Sync Finished. Operations: {len(actions)}\n")
 
