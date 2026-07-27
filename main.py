@@ -52,10 +52,10 @@ from PyQt6.QtWidgets import (
     QListWidget, QPushButton, QLabel, QTextEdit, QCheckBox, QComboBox,
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
     QProgressBar, QFileDialog, QGroupBox, QRadioButton, QSpinBox, QFrame,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QSplitter
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QSplitter, QSystemTrayIcon, QMenu
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
-from PyQt6.QtGui import QIcon, QColor
+from PyQt6.QtGui import QIcon, QColor, QAction
 from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
 from engine import SyncEngine
 from drive_detector import DriveWatcherThread
@@ -68,29 +68,43 @@ except ImportError:
     WATCHDOG_AVAILABLE = False
 
 
+# --- Thread-Safe Watchdog Signal Bridge ---
 class WatchdogSignalBridge(QObject):
-    file_changed = pyqtSignal(str)
+    file_changed = pyqtSignal(str, str)  # (event_type, path)
 
 
 if WATCHDOG_AVAILABLE:
     class RobustChangeHandler(FileSystemEventHandler):
-        def __init__(self, bridge: WatchdogSignalBridge, debounce_seconds: int = 3):
+        def __init__(self, bridge: WatchdogSignalBridge, debounce_seconds: int = 1):
             super().__init__()
             self.bridge = bridge
             self.debounce_seconds = debounce_seconds
             self.last_event_time = 0
 
-        def on_any_event(self, event):
-            if event.is_directory or "$RECYCLE.BIN" in event.src_path or event.src_path.endswith(".tmp"):
+        def _handle_event(self, event_type: str, src_path: str):
+            if "$RECYCLE.BIN" in src_path or src_path.endswith(".tmp") or src_path.endswith("~"):
                 return
-            
             current_time = time.time()
             if current_time - self.last_event_time > self.debounce_seconds:
                 self.last_event_time = current_time
-                self.bridge.file_changed.emit(f"Change detected: {os.path.basename(event.src_path)}")
+                filename = os.path.basename(src_path) or src_path
+                self.bridge.file_changed.emit(event_type, filename)
+
+        def on_created(self, event):
+            self._handle_event("Created", event.src_path)
+
+        def on_modified(self, event):
+            if not event.is_directory:
+                self._handle_event("Modified", event.src_path)
+
+        def on_deleted(self, event):
+            self._handle_event("Deleted", event.src_path)
+
+        def on_moved(self, event):
+            self._handle_event("Renamed", event.dest_path)
 
     class SmartFolderWatcherManager:
-        def __init__(self, watch_paths: List[str], callback: Callable[[str], None], debounce_seconds: int = 3):
+        def __init__(self, watch_paths: List[str], callback: Callable[[str, str], None], debounce_seconds: int = 1):
             self.watch_paths = watch_paths
             self.callback = callback
             self.bridge = WatchdogSignalBridge()
@@ -130,7 +144,7 @@ QWidget {
 #ToolbarFrame {
     background-color: #1E1F2E;
     border-bottom: 1px solid #28293D;
-    padding: 6px;
+    padding: 6px 12px;
 }
 
 QPushButton#RibbonBtn {
@@ -138,9 +152,9 @@ QPushButton#RibbonBtn {
     color: #FFFFFF;
     border: 1px solid #3B3C54;
     border-radius: 8px;
-    padding: 8px 16px;
+    padding: 7px 14px;
     font-weight: bold;
-    font-size: 13px;
+    font-size: 12px;
 }
 
 QPushButton#RibbonBtn:hover {
@@ -153,28 +167,27 @@ QPushButton#RibbonBtnPrimary {
     color: #FFFFFF;
     border: none;
     border-radius: 8px;
-    padding: 8px 18px;
+    padding: 7px 16px;
     font-weight: bold;
-    font-size: 13px;
+    font-size: 12px;
 }
 
 QPushButton#RibbonBtnPrimary:hover {
     background-color: #7D6EEB;
 }
 
-/* Connection Header Bar */
+/* Compact Connection Header Bar */
 #ConnectionHeader {
     background-color: #171824;
-    border-radius: 10px;
-    padding: 8px 14px;
-    border: 1px solid #28293D;
+    border-bottom: 1px solid #28293D;
+    padding: 6px 16px;
 }
 
-/* Card Containers */
-#DashboardCard {
+#PathCard {
     background-color: #1E1F2E;
-    border-radius: 12px;
-    border: 1px solid #28293D;
+    border: 1px solid #2B2C42;
+    border-radius: 8px;
+    padding: 4px 10px;
 }
 
 /* Trees & Tables */
@@ -195,7 +208,7 @@ QHeaderView::section {
 }
 
 QTreeWidget::item {
-    padding: 6px;
+    padding: 5px;
     border-bottom: 1px solid #1E1F2E;
 }
 
@@ -372,11 +385,13 @@ class SyncWorker(QThread):
             actions = self.engine.plan_job(self.job)
             total = len(actions)
 
+            if total == 0:
+                self.progress_update.emit(100, "No pending file changes detected.")
+
             for idx, action in enumerate(actions, 1):
                 pct = int((idx / total) * 100) if total > 0 else 100
                 msg = f"[{action.action_type}] {action.target_path or action.source_path}"
 
-                # Emit to Diff Tree View
                 self.action_item_signal.emit({
                     "action_type": action.action_type,
                     "source": action.source_path or "-",
@@ -521,13 +536,10 @@ class MainWindow(QMainWindow):
         self.app_mode = app_mode
         self.config_dir = config_dir
         self.install_dir = install_dir
-        self.setWindowTitle(f"SyncDrive Studio - GoodSync Style [{self.app_mode.value.upper()}]")
+        self.force_quit = False
+        self.setWindowTitle(f"SyncDrive Studio [{self.app_mode.value.upper()}]")
         self.resize(1150, 720)
         self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
-
-        icon_path = (self.install_dir or config_dir) / "app_icon.ico"
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
 
         self.engine = SyncEngine()
         self.jobs = [
@@ -543,6 +555,7 @@ class MainWindow(QMainWindow):
 
         self.smart_watchers = []
         self.init_ui()
+        self.init_system_tray()
         self.refresh_job_tree()
         self.init_drive_watcher()
         self.init_timers_and_smart_watchers()
@@ -553,7 +566,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ---------------- 1. Top Ribbon Toolbar (GoodSync Style) ----------------
+        # 1. Top Ribbon Toolbar
         toolbar = QFrame()
         toolbar.setObjectName("ToolbarFrame")
         tb_layout = QHBoxLayout(toolbar)
@@ -601,38 +614,48 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(toolbar)
 
-        # ---------------- 2. Source <-> Target Connector Header ----------------
+        # 2. Compact Source <-> Target Header Bar
         conn_frame = QFrame()
         conn_frame.setObjectName("ConnectionHeader")
+        conn_frame.setFixedHeight(48)
         conn_layout = QHBoxLayout(conn_frame)
+        conn_layout.setContentsMargins(12, 4, 12, 4)
 
+        src_card = QFrame()
+        src_card.setObjectName("PathCard")
+        src_c_layout = QHBoxLayout(src_card)
+        src_c_layout.setContentsMargins(8, 2, 8, 2)
         self.src_lbl = QLabel("📁 Source: (Select a job)")
         self.src_lbl.setStyleSheet("font-weight: bold; color: #00ADB5;")
-        
+        src_c_layout.addWidget(self.src_lbl)
+        conn_layout.addWidget(src_card, 1)
+
         arrow_lbl = QLabel(" ↔ ")
         arrow_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #6C5CE7;")
+        conn_layout.addWidget(arrow_lbl, 0, Qt.AlignmentFlag.AlignCenter)
 
+        dst_card = QFrame()
+        dst_card.setObjectName("PathCard")
+        dst_c_layout = QHBoxLayout(dst_card)
+        dst_c_layout.setContentsMargins(8, 2, 8, 2)
         self.dst_lbl = QLabel("💾 Target: (Select a job)")
         self.dst_lbl.setStyleSheet("font-weight: bold; color: #00B894;")
-
-        conn_layout.addWidget(self.src_lbl)
-        conn_layout.addWidget(arrow_lbl)
-        conn_layout.addWidget(self.dst_lbl)
-        conn_layout.addStretch()
+        dst_c_layout.addWidget(self.dst_lbl)
+        conn_layout.addWidget(dst_card, 1)
 
         layout.addWidget(conn_frame)
 
-        # ---------------- 3. Main Split View (Job Tree + Diff View) ----------------
+        # 3. Splitter View
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left Panel: GoodSync Task List Tree
+        # Left Panel: Job Tree
         self.job_tree = QTreeWidget()
         self.job_tree.setHeaderLabel("All Sync Jobs")
         self.job_tree.setFixedWidth(220)
         self.job_tree.currentItemChanged.connect(self.on_job_tree_selected)
         splitter.addWidget(self.job_tree)
 
-        # Right Center Panel: Differential Comparison Tree Table
+        # Right Panel: Diff Comparison View + Realtime Log Output
         right_container = QWidget()
         rc_layout = QVBoxLayout(right_container)
         rc_layout.setContentsMargins(4, 4, 4, 4)
@@ -646,7 +669,6 @@ class MainWindow(QMainWindow):
         self.diff_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         rc_layout.addWidget(self.diff_tree)
 
-        # Bottom Realtime Log Output
         self.log_output = QTextEdit()
         self.log_output.setFixedHeight(120)
         self.log_output.setReadOnly(True)
@@ -658,9 +680,63 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
         self.setCentralWidget(main_widget)
 
+    def init_system_tray(self):
+        """Configures System Tray for background watching when minimized or closed."""
+        self.tray_icon = QSystemTrayIcon(self)
+        
+        icon_path = (self.install_dir or self.config_dir) / "app_icon.ico"
+        if icon_path.exists():
+            self.tray_icon.setIcon(QIcon(str(icon_path)))
+            self.setWindowIcon(QIcon(str(icon_path)))
+        else:
+            self.tray_icon.setIcon(self.style().standardIcon(QApplication.Style().SP_DriveHDIcon))
+
+        tray_menu = QMenu()
+        show_action = QAction("Open SyncDrive Studio", self)
+        show_action.triggered.connect(self.show_normal_and_raise)
+        
+        hide_action = QAction("Minimize to Tray", self)
+        hide_action.triggered.connect(self.hide)
+
+        quit_action = QAction("Exit Completely", self)
+        quit_action.triggered.connect(self.exit_app_completely)
+
+        tray_menu.addAction(show_action)
+        tray_menu.addAction(hide_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_icon_activated)
+        self.tray_icon.show()
+
+    def show_normal_and_raise(self):
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def on_tray_icon_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible():
+                self.hide()
+            else:
+                self.show_normal_and_raise()
+
+    def changeEvent(self, event):
+        """Catch window minimization and redirect to system tray."""
+        if event.type() == event.Type.WindowStateChange:
+            if self.windowState() & Qt.WindowState.WindowMinimized:
+                QTimer.singleShot(0, self.hide)
+                self.tray_icon.showMessage(
+                    "SyncDrive Studio",
+                    "Running in background. Double-click tray icon to restore.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    2000
+                )
+        super().changeEvent(event)
+
     def refresh_job_tree(self):
         self.job_tree.clear()
-        
         backup_node = QTreeWidgetItem(self.job_tree, ["📁 One-Way Backup Tasks"])
         mirror_node = QTreeWidgetItem(self.job_tree, ["🪞 Mirror Tasks"])
         twoway_node = QTreeWidgetItem(self.job_tree, ["🔄 Bidirectional Tasks"])
@@ -729,8 +805,8 @@ class MainWindow(QMainWindow):
         self.watcher.start()
 
     def _create_change_callback(self, job: SyncJob):
-        def _callback(msg: str):
-            self.on_smart_change(job, msg)
+        def _callback(event_type: str, filename: str):
+            self.on_smart_change(job, event_type, filename)
         return _callback
 
     def init_timers_and_smart_watchers(self):
@@ -747,7 +823,7 @@ class MainWindow(QMainWindow):
                 interval_ms = job.interval_minutes * 60 * 1000
                 timer.timeout.connect(lambda j=job: self.execute_job_instance(j, dry_run=False))
                 timer.start(interval_ms)
-                self.log_output.append(f"⏱️ Scheduled timer: '{job.name}' ({job.interval_minutes}m)")
+                self.log_output.append(f"⏱️ Scheduled timer active: '{job.name}' ({job.interval_minutes}m)")
 
             elif job.schedule_type == ScheduleType.ON_FILE_CHANGE and WATCHDOG_AVAILABLE:
                 valid_paths = [os.path.abspath(os.path.normpath(p)) for p in job.sources if pathlib.Path(p).exists()]
@@ -756,10 +832,10 @@ class MainWindow(QMainWindow):
                     watcher = SmartFolderWatcherManager(valid_paths, callback=callback_slot, debounce_seconds=job.debounce_seconds)
                     watcher.start()
                     self.smart_watchers.append(watcher)
-                    self.log_output.append(f"👁️ OS Kernel Watcher Active: '{job.name}'")
+                    self.log_output.append(f"👁️ Real-time Watcher Active: '{job.name}' monitoring {len(valid_paths)} folder(s)")
 
-    def on_smart_change(self, job: SyncJob, msg: str):
-        self.log_output.append(f"🔔 {msg} for '{job.name}' -> Executing task...")
+    def on_smart_change(self, job: SyncJob, event_type: str, filename: str):
+        self.log_output.append(f"🔔 Realtime Event: [{event_type}] '{filename}' in job '{job.name}' -> Syncing...")
         self.execute_job_instance(job, dry_run=False)
 
     def on_drive_plugged_in(self, mountpoint: str):
@@ -809,11 +885,26 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.log_output.append(f"✅ Sync Finished. Operations: {len(actions)}\n")
 
+    def exit_app_completely(self):
+        self.force_quit = True
+        self.close()
+
     def closeEvent(self, event):
-        self.watcher.stop()
-        for w in self.smart_watchers:
-            w.stop()
-        event.accept()
+        if not self.force_quit:
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "SyncDrive Studio Active",
+                "App minimized to System Tray. Background watchers remain active.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000
+            )
+        else:
+            self.watcher.stop()
+            for w in self.smart_watchers:
+                w.stop()
+            self.tray_icon.hide()
+            event.accept()
 
 
 if __name__ == "__main__":
