@@ -9,6 +9,10 @@ import pathlib
 from enum import Enum
 from typing import List, Callable
 
+# MUST call freeze_support at script load time for Windows PyInstaller single-file builds
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
 REQUIRED_PACKAGES = {
     "PyQt6": "PyQt6",
     "pydantic": "pydantic",
@@ -560,7 +564,6 @@ class MainWindow(QMainWindow):
             desktop_link.unlink(missing_ok=True)
             start_link.unlink(missing_ok=True)
 
-            # Reset saved mode flag so setup wizard appears on next run
             mode_file = self.config_dir.parent / ".app_mode"
             mode_file.unlink(missing_ok=True)
 
@@ -641,8 +644,8 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+# --- Application Entrypoint ---
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
     app = QApplication(sys.argv)
 
     if getattr(sys, 'frozen', False):
@@ -657,7 +660,6 @@ if __name__ == "__main__":
     selected_mode = None
     target_install_dir = None
 
-    # Always trigger Setup Wizard if .app_mode does not exist
     if mode_file.exists():
         selected_mode = AppMode.PORTABLE if mode_file.read_text().strip() == AppMode.PORTABLE.value else AppMode.INSTALLED
     else:
