@@ -11,17 +11,18 @@ from enum import Enum
 REQUIRED_PACKAGES = {
     "PyQt6": "PyQt6",
     "pydantic": "pydantic",
-    "psutil": "psutil"
+    "psutil": "psutil",
+    "watchdog": "watchdog"
 }
 
 def auto_install_dependencies():
-    """Checks for required packages and displays a visual progress bar during installation."""
+    """Checks for required packages and installs missing ones with visual progress."""
     missing = [pkg for pkg, imp in REQUIRED_PACKAGES.items() if importlib.util.find_spec(imp) is None]
 
     if missing:
         print("\n==================================================")
-        print(" [SyncDrive Studio] First-Time Setup Detected")
-        print(f" Installing required libraries: {', '.join(missing)}")
+        print(" [SyncDrive Studio] Installing Smart Event Monitor")
+        print(f" Packages: {', '.join(missing)}")
         print("==================================================\n")
 
         total = len(missing)
@@ -39,9 +40,8 @@ def auto_install_dependencies():
             except Exception as e:
                 print(f"\n❌ Error installing {pkg}: {e}")
                 sys.exit(1)
-        print("\n\n✅ All dependencies successfully installed!\n")
+        print("\n\n✅ Dependencies updated successfully!\n")
 
-# Run auto-installer only when running as source
 if not getattr(sys, 'frozen', False):
     auto_install_dependencies()
 
@@ -49,12 +49,14 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QLabel, QTextEdit, QCheckBox, QComboBox,
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
-    QProgressBar, QFileDialog, QGroupBox, QRadioButton, QButtonGroup
+    QProgressBar, QFileDialog, QGroupBox, QRadioButton, QSpinBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QIcon
 from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
 from engine import SyncEngine
 from drive_detector import DriveWatcherThread
+from smart_watcher import SmartFolderWatcherThread
 
 
 DARK_STYLESHEET = """
@@ -65,10 +67,9 @@ QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color:
 QPushButton { background-color: #00ADB5; color: #FFFFFF; border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; }
 QPushButton:hover { background-color: #00FFF5; color: #121212; }
 QPushButton:disabled { background-color: #333333; color: #777777; }
-QLineEdit, QComboBox, QTextEdit, QListWidget { background-color: #252525; border: 1px solid #333333; border-radius: 6px; padding: 6px; color: #EEEEEE; }
+QLineEdit, QComboBox, QTextEdit, QListWidget, QSpinBox { background-color: #252525; border: 1px solid #333333; border-radius: 6px; padding: 6px; color: #EEEEEE; }
 QProgressBar { border: 1px solid #333333; border-radius: 6px; text-align: center; background-color: #252525; }
 QProgressBar::chunk { background-color: #00ADB5; border-radius: 5px; }
-QRadioButton { color: #EEEEEE; font-size: 13px; padding: 4px; }
 """
 
 
@@ -77,57 +78,66 @@ class AppMode(str, Enum):
     INSTALLED = "installed"
 
 
+def create_windows_shortcut(target_exe: pathlib.Path, shortcut_path: pathlib.Path, icon_path: pathlib.Path = None):
+    """Creates a Windows .lnk shortcut automatically using VBScript."""
+    if not sys.platform.startswith("win"):
+        return
+
+    icon_str = f'oLink.IconLocation = "{icon_path}"' if icon_path and icon_path.exists() else ''
+    
+    vbs_script = f"""
+    Set oWS = WScript.CreateObject("WScript.Shell")
+    sLinkFile = "{shortcut_path}"
+    Set oLink = oWS.CreateShortcut(sLinkFile)
+    oLink.TargetPath = "{target_exe}"
+    oLink.WorkingDirectory = "{target_exe.parent}"
+    {icon_str}
+    oLink.Save
+    """
+    
+    vbs_path = target_exe.parent / "create_shortcut.vbs"
+    try:
+        vbs_path.write_text(vbs_script)
+        subprocess.run(["cscript", "//Nologo", str(vbs_path)], check=True)
+        vbs_path.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"Shortcut creation failed: {e}")
+
+
 class SetupWizardDialog(QDialog):
-    """First-run installation wizard to choose between Portable or Install Mode."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("SyncDrive Studio - Setup Wizard")
-        self.setFixedSize(500, 320)
+        self.setFixedSize(520, 320)
         self.setStyleSheet(DARK_STYLESHEET)
         self.selected_mode = AppMode.PORTABLE
 
         layout = QVBoxLayout(self)
-
+        
         title = QLabel("Welcome to SyncDrive Studio")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #00ADB5; margin-bottom: 5px;")
-        subtitle = QLabel("Select how you would like to run the application on this machine:")
-        subtitle.setWordWrap(True)
-
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #00ADB5;")
         layout.addWidget(title)
+        
+        subtitle = QLabel("Select deployment mode for this machine:")
         layout.addWidget(subtitle)
 
-        # Selection Group
         mode_group = QGroupBox("Deployment Mode")
         mode_box = QVBoxLayout(mode_group)
 
-        self.radio_portable = QRadioButton("📁 Portable Mode (Recommended for USB Drives)")
+        self.radio_portable = QRadioButton("📁 Portable Mode (Runs from current folder/USB drive)")
         self.radio_portable.setChecked(True)
-        lbl_portable = QLabel("   • Stores configurations in the app folder.\n   • No registry modifications or system files written.")
-        lbl_portable.setStyleSheet("color: #888888; font-size: 11px;")
-
-        self.radio_install = QRadioButton("💻 System Install Mode (Recommended for Desktop PCs)")
-        lbl_install = QLabel("   • Stores profiles in User AppData (~/.syncdrive_studio).\n   • Includes uninstaller tool and system integration.")
-        lbl_install.setStyleSheet("color: #888888; font-size: 11px;")
+        self.radio_install = QRadioButton("💻 System Install Mode (Copies to Program Files + Desktop/Start Shortcuts)")
 
         mode_box.addWidget(self.radio_portable)
-        mode_box.addWidget(lbl_portable)
-        mode_box.addSpacing(10)
         mode_box.addWidget(self.radio_install)
-        mode_box.addWidget(lbl_install)
-
         layout.addWidget(mode_group)
 
-        # Action Buttons
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Confirm & Launch")
         self.buttons.accepted.connect(self.on_confirm)
         layout.addWidget(self.buttons)
 
     def on_confirm(self):
-        if self.radio_install.isChecked():
-            self.selected_mode = AppMode.INSTALLED
-        else:
-            self.selected_mode = AppMode.PORTABLE
+        self.selected_mode = AppMode.INSTALLED if self.radio_install.isChecked() else AppMode.PORTABLE
         self.accept()
 
 
@@ -155,7 +165,6 @@ class SyncWorker(QThread):
                 pct = int((idx / total) * 100)
                 msg = f"[{action.action_type}] {action.target_path or action.source_path}"
 
-                # Perform copy/delete operations
                 if action.action_type == "COPY_TO_TARGET":
                     d = pathlib.Path(action.target_path)
                     d.parent.mkdir(parents=True, exist_ok=True)
@@ -175,18 +184,16 @@ class SyncWorker(QThread):
 
 
 class ModernJobDialog(QDialog):
-    """Redesigned Job Creation Dialog with Top Selectors and Visual Dual Drive Cards."""
     def __init__(self, parent=None, job: SyncJob = None):
         super().__init__(parent)
-        self.setWindowTitle("Configure Sync Job")
-        self.resize(650, 480)
+        self.setWindowTitle("Configure Sync Job & Smart Triggers")
+        self.resize(650, 520)
         self.setStyleSheet(DARK_STYLESHEET)
         self.job = job
 
         layout = QVBoxLayout(self)
 
-        # Top Configuration Bar
-        top_group = QGroupBox("1. Execution Settings & Sync Mode")
+        top_group = QGroupBox("1. Execution Settings & Smart Triggers")
         top_layout = QFormLayout(top_group)
 
         self.name_input = QLineEdit(job.name if job else "New Sync Job")
@@ -200,30 +207,34 @@ class ModernJobDialog(QDialog):
         self.schedule_combo = QComboBox()
         self.schedule_combo.addItems([s.value for s in ScheduleType])
         if job: self.schedule_combo.setCurrentText(job.schedule_type.value)
-        top_layout.addRow("Trigger Schedule:", self.schedule_combo)
+        self.schedule_combo.currentTextChanged.connect(self.toggle_trigger_options)
+        top_layout.addRow("Trigger Strategy:", self.schedule_combo)
+
+        # Interval Spinner Controls
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 1440)
+        self.interval_spin.setValue(job.interval_minutes if job else 30)
+        self.interval_spin.setSuffix(" Minutes")
+        top_layout.addRow("Repeat Interval:", self.interval_spin)
 
         layout.addWidget(top_group)
 
-        # Middle Dual Section (Source vs Targets)
+        # Folder Selectors
         drive_section = QHBoxLayout()
 
-        # Left Card: Sources
-        src_group = QGroupBox("2. Source Drive / Folders")
+        src_group = QGroupBox("2. Source Folders")
         src_box = QVBoxLayout(src_group)
         self.src_input = QLineEdit(", ".join(job.sources) if job else "")
-        self.src_input.setPlaceholderText("Select or enter folder paths...")
-        src_browse = QPushButton("📁 Browse Source")
+        src_browse = QPushButton("📁 Select Source")
         src_browse.clicked.connect(self.browse_source)
         src_box.addWidget(self.src_input)
         src_box.addWidget(src_browse)
         drive_section.addWidget(src_group)
 
-        # Right Card: Targets
         dst_group = QGroupBox("3. Target Drives / Folders")
         dst_box = QVBoxLayout(dst_group)
         self.dst_input = QLineEdit(", ".join(job.targets) if job else "")
-        self.dst_input.setPlaceholderText("Select target drives/folders...")
-        dst_browse = QPushButton("💾 Browse Target")
+        dst_browse = QPushButton("💾 Select Target")
         dst_browse.clicked.connect(self.browse_target)
         dst_box.addWidget(self.dst_input)
         dst_box.addWidget(dst_browse)
@@ -231,11 +242,16 @@ class ModernJobDialog(QDialog):
 
         layout.addLayout(drive_section)
 
-        # Dialog Buttons
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+
+        self.toggle_trigger_options(self.schedule_combo.currentText())
+
+    def toggle_trigger_options(self, selected_mode: str):
+        is_interval = (selected_mode == ScheduleType.INTERVAL.value)
+        self.interval_spin.setEnabled(is_interval)
 
     def browse_source(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
@@ -261,41 +277,50 @@ class ModernJobDialog(QDialog):
             sources=sources,
             targets=targets,
             mode=SyncMode(self.mode_combo.currentText()),
-            schedule_type=ScheduleType(self.schedule_combo.currentText())
+            schedule_type=ScheduleType(self.schedule_combo.currentText()),
+            interval_minutes=self.interval_spin.value()
         )
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, app_mode: AppMode, config_dir: pathlib.Path):
+    def __init__(self, app_mode: AppMode, config_dir: pathlib.Path, install_dir: pathlib.Path = None):
         super().__init__()
         self.app_mode = app_mode
         self.config_dir = config_dir
+        self.install_dir = install_dir
         self.setWindowTitle(f"SyncDrive Studio [{self.app_mode.value.upper()} MODE]")
         self.resize(1000, 680)
         self.setStyleSheet(DARK_STYLESHEET)
 
+        # Set Window Icon
+        icon_path = (self.install_dir or config_dir) / "app_icon.ico"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
         self.engine = SyncEngine()
         self.jobs = [
             SyncJob(
-                name="Multi-Drive Photo Backup",
+                name="Smart Photo Backup",
                 sources=["C:/Photos"],
-                targets=["E:/Drive_Backup1", "F:/Drive_Backup2"],
+                targets=["E:/BackupDrive"],
                 mode=SyncMode.ONE_WAY_BACKUP,
-                schedule_type=ScheduleType.ON_DRIVE_CONNECT
+                schedule_type=ScheduleType.ON_FILE_CHANGE,
+                interval_minutes=15
             )
         ]
 
+        self.smart_watchers = []
         self.init_ui()
         self.refresh_job_list()
         self.init_drive_watcher()
+        self.init_timers_and_smart_watchers()
 
     def init_ui(self):
         main_widget = QWidget()
         layout = QHBoxLayout(main_widget)
 
-        # Left Sidebar Panel
         left_panel = QVBoxLayout()
-        left_group = QGroupBox("Active Jobs")
+        left_group = QGroupBox("Active Sync Jobs")
         left_box = QVBoxLayout(left_group)
 
         self.job_list = QListWidget()
@@ -316,48 +341,40 @@ class MainWindow(QMainWindow):
         left_box.addLayout(btn_box)
 
         # Uninstall / Cleanup Data Button
-        uninstall_btn = QPushButton("🗑️ Uninstall / Wipe Setup Data")
+        uninstall_btn = QPushButton("🗑️ Uninstall SyncDrive Studio")
         uninstall_btn.setStyleSheet("background-color: #D9534F; color: white; margin-top: 10px;")
         uninstall_btn.clicked.connect(self.run_uninstall)
         left_box.addWidget(uninstall_btn)
 
         left_panel.addWidget(left_group)
 
-        # Right Dashboard Panel
         right_panel = QVBoxLayout()
-
-        # Visual Dashboard Cards
-        dash_group = QGroupBox("Live Execution Dashboard")
+        dash_group = QGroupBox("Execution Engine Dashboard")
         dash_layout = QVBoxLayout(dash_group)
 
-        self.status_label = QLabel(f"Status: Ready ({self.app_mode.value.capitalize()} Mode)")
+        self.status_label = QLabel(f"Status: Active Engine ({self.app_mode.value.capitalize()})")
         self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #00ADB5;")
         dash_layout.addWidget(self.status_label)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
         dash_layout.addWidget(self.progress_bar)
 
         ctrl_layout = QHBoxLayout()
-        self.dry_run_cb = QCheckBox("Dry Run Mode (Simulate without file changes)")
+        self.dry_run_cb = QCheckBox("Dry Run Mode (Simulate without copying)")
         ctrl_layout.addWidget(self.dry_run_cb)
 
         self.run_btn = QPushButton("▶ Run Selected Job")
-        self.run_btn.setStyleSheet("font-size: 14px; padding: 10px;")
         self.run_btn.clicked.connect(self.run_job)
         ctrl_layout.addWidget(self.run_btn)
 
         dash_layout.addLayout(ctrl_layout)
         right_panel.addWidget(dash_group)
 
-        # Activity Log Card
-        log_group = QGroupBox("Live Report & Activity Log")
+        log_group = QGroupBox("Live Action Log")
         log_layout = QVBoxLayout(log_group)
-
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         log_layout.addWidget(self.log_output)
-
         right_panel.addWidget(log_group)
 
         layout.addLayout(left_panel, 1)
@@ -367,20 +384,21 @@ class MainWindow(QMainWindow):
     def refresh_job_list(self):
         self.job_list.clear()
         for j in self.jobs:
-            self.job_list.addItem(f"⚡ {j.name} [{j.mode.value}]")
+            self.job_list.addItem(f"⚡ {j.name} [{j.schedule_type.value}]")
         if self.jobs:
             self.job_list.setCurrentRow(0)
 
     def on_job_selected(self, index: int):
         if 0 <= index < len(self.jobs):
             job = self.jobs[index]
-            self.log_output.append(f"ℹ️ Selected: '{job.name}' | Sources: {len(job.sources)} | Targets: {len(job.targets)}")
+            self.log_output.append(f"ℹ️ Selected '{job.name}' | Trigger: {job.schedule_type.value}")
 
     def add_job(self):
         dialog = ModernJobDialog(self)
         if dialog.exec():
             self.jobs.append(dialog.get_job())
             self.refresh_job_list()
+            self.init_timers_and_smart_watchers()
 
     def edit_job(self):
         idx = self.job_list.currentRow()
@@ -389,24 +407,35 @@ class MainWindow(QMainWindow):
             if dialog.exec():
                 self.jobs[idx] = dialog.get_job()
                 self.refresh_job_list()
+                self.init_timers_and_smart_watchers()
 
     def delete_job(self):
         idx = self.job_list.currentRow()
         if idx >= 0:
             del self.jobs[idx]
             self.refresh_job_list()
+            self.init_timers_and_smart_watchers()
 
     def run_uninstall(self):
         reply = QMessageBox.warning(
             self,
-            "Uninstall & Clear Data",
-            f"Are you sure you want to remove all configuration data?\n\nTarget directory:\n{self.config_dir}",
+            "Uninstall SyncDrive Studio",
+            "Are you sure you want to uninstall SyncDrive Studio?\nThis will remove application shortcuts and config data.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
+            # Delete Desktop & Start Menu Shortcuts
+            desktop_link = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
+            start_link = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
+            
+            desktop_link.unlink(missing_ok=True)
+            start_link.unlink(missing_ok=True)
+
+            # Clean Config Directory
             if self.config_dir.exists():
                 shutil.rmtree(self.config_dir, ignore_errors=True)
-            QMessageBox.information(self, "Uninstall Complete", "Setup data and profiles have been completely removed.")
+
+            QMessageBox.information(self, "Uninstall Complete", "SyncDrive Studio has been successfully removed.")
             self.close()
 
     def init_drive_watcher(self):
@@ -414,53 +443,69 @@ class MainWindow(QMainWindow):
         self.watcher.drive_connected.connect(self.on_drive_plugged_in)
         self.watcher.start()
 
+    def init_timers_and_smart_watchers(self):
+        for w in self.smart_watchers:
+            w.stop()
+        self.smart_watchers.clear()
+
+        for job in self.jobs:
+            if not job.is_active:
+                continue
+
+            if job.schedule_type == ScheduleType.INTERVAL:
+                timer = QTimer(self)
+                interval_ms = job.interval_minutes * 60 * 1000
+                timer.timeout.connect(lambda j=job: self.execute_job_instance(j, dry_run=False))
+                timer.start(interval_ms)
+                self.log_output.append(f"⏱️ Scheduled timer: '{job.name}' every {job.interval_minutes} mins")
+
+            elif job.schedule_type == ScheduleType.ON_FILE_CHANGE:
+                valid_paths = [p for p in job.sources if pathlib.Path(p).exists()]
+                if valid_paths:
+                    watcher = SmartFolderWatcherThread(valid_paths, debounce_seconds=job.debounce_seconds)
+                    watcher.change_detected.connect(lambda msg, j=job: self.on_smart_change(j, msg))
+                    watcher.start()
+                    self.smart_watchers.append(watcher)
+                    self.log_output.append(f"👁️ Active Kernel Watcher: '{job.name}' monitoring source folders")
+
+    def on_smart_change(self, job: SyncJob, msg: str):
+        self.log_output.append(f"🔔 {msg} for '{job.name}'")
+        self.execute_job_instance(job, dry_run=False)
+
     def on_drive_plugged_in(self, mountpoint: str):
         self.log_output.append(f"🔌 Drive Attached: {mountpoint}")
         for job in self.jobs:
             if job.schedule_type == ScheduleType.ON_DRIVE_CONNECT and job.is_active:
                 if any(mountpoint in t for t in job.targets):
-                    self.log_output.append(f"🚀 Auto-triggering: '{job.name}'")
                     self.execute_job_instance(job, dry_run=False)
 
     def run_job(self):
         idx = self.job_list.currentRow()
-        if idx < 0:
-            QMessageBox.critical(self, "Error", "No job selected!")
-            return
-        job = self.jobs[idx]
-        self.execute_job_instance(job, dry_run=self.dry_run_cb.isChecked())
+        if idx >= 0:
+            self.execute_job_instance(self.jobs[idx], dry_run=self.dry_run_cb.isChecked())
 
     def execute_job_instance(self, job: SyncJob, dry_run: bool):
         self.run_btn.setEnabled(False)
         self.progress_bar.setValue(0)
-        mode_str = "DRY RUN SIMULATION" if dry_run else "LIVE SYNC"
-        self.status_label.setText(f"Status: Running {job.name} ({mode_str})...")
-        self.log_output.append(f"\n--- Starting {job.name} [{mode_str}] ---")
+        mode_str = "SIMULATION" if dry_run else "LIVE SYNC"
+        self.status_label.setText(f"Status: Executing {job.name} ({mode_str})...")
 
         self.worker = SyncWorker(self.engine, job, dry_run)
-        self.worker.progress_update.connect(self.on_progress)
-        self.worker.error_signal.connect(self.on_error)
-        self.worker.finished_signal.connect(self.on_finished)
+        self.worker.progress_update.connect(lambda pct, msg: (self.progress_bar.setValue(pct), self.log_output.append(msg)))
+        self.worker.error_signal.connect(lambda err: QMessageBox.critical(self, "Error", err))
+        self.worker.finished_signal.connect(self.on_sync_finished)
         self.worker.start()
 
-    def on_progress(self, percent: int, msg: str):
-        self.progress_bar.setValue(percent)
-        self.log_output.append(msg)
-
-    def on_error(self, err_msg: str):
-        self.run_btn.setEnabled(True)
-        self.status_label.setText("Status: Error encountered!")
-        self.log_output.append(f"❌ ERROR: {err_msg}")
-        QMessageBox.critical(self, "Sync Error", f"An error occurred during execution:\n{err_msg}")
-
-    def on_finished(self, actions):
+    def on_sync_finished(self, actions):
         self.run_btn.setEnabled(True)
         self.progress_bar.setValue(100)
-        self.status_label.setText("Status: Completed successfully")
-        self.log_output.append(f"✅ Sync Finished. Total actions planned/executed: {len(actions)}\n")
+        self.status_label.setText("Status: Engine Idle / Ready")
+        self.log_output.append(f"✅ Sync Finished. Operations: {len(actions)}\n")
 
     def closeEvent(self, event):
         self.watcher.stop()
+        for w in self.smart_watchers:
+            w.stop()
         event.accept()
 
 
@@ -468,43 +513,59 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     app = QApplication(sys.argv)
 
-    # Determine Base Executable Directory
     if getattr(sys, 'frozen', False):
-        exe_dir = pathlib.Path(sys.executable).parent
+        exe_path = pathlib.Path(sys.executable)
+        exe_dir = exe_path.parent
     else:
-        exe_dir = pathlib.Path(__file__).parent
+        exe_path = pathlib.Path(__file__)
+        exe_dir = exe_path.parent
 
     mode_file = exe_dir / ".app_mode"
-    portable_config_dir = exe_dir / ".config"
-    installed_config_dir = pathlib.Path.home() / ".syncdrive_studio"
+    
+    # Target Install Path in Program Files (or LocalAppData fallback if non-admin)
+    program_files_dir = pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio"
+    user_appdata_dir = pathlib.Path.home() / "AppData/Local/Programs/SyncDrive Studio"
 
     selected_mode = None
-    config_dir = None
-
-    # Check for existing mode file
     if mode_file.exists():
-        mode_str = mode_file.read_text().strip()
-        selected_mode = AppMode.PORTABLE if mode_str == AppMode.PORTABLE.value else AppMode.INSTALLED
+        selected_mode = AppMode.PORTABLE if mode_file.read_text().strip() == AppMode.PORTABLE.value else AppMode.INSTALLED
     else:
-        # Prompt First-Run Wizard
         wizard = SetupWizardDialog()
         if wizard.exec() == QDialog.DialogCode.Accepted:
             selected_mode = wizard.selected_mode
             try:
                 mode_file.write_text(selected_mode.value)
             except Exception:
-                pass  # Read-only location fallback
+                pass
         else:
             sys.exit(0)
 
-    # Assign configuration storage path based on selected mode
-    if selected_mode == AppMode.PORTABLE:
-        config_dir = portable_config_dir
-    else:
-        config_dir = installed_config_dir
-
+    config_dir = exe_dir / ".config" if selected_mode == AppMode.PORTABLE else pathlib.Path.home() / ".syncdrive_studio"
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    window = MainWindow(app_mode=selected_mode, config_dir=config_dir)
+    target_install_dir = None
+
+    # Handle Program Files setup & Shortcut generation for Install Mode
+    if selected_mode == AppMode.INSTALLED and getattr(sys, 'frozen', False):
+        try:
+            target_install_dir = program_files_dir
+            target_install_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            target_install_dir = user_appdata_dir
+            target_install_dir.mkdir(parents=True, exist_ok=True)
+
+        installed_exe = target_install_dir / "SyncDriveStudio.exe"
+        if exe_path != installed_exe and not installed_exe.exists():
+            shutil.copy2(exe_path, installed_exe)
+
+        # Generate Shortcuts with Icons
+        desktop_shortcut = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
+        start_menu_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
+        icon_file = exe_dir / "app_icon.ico"
+
+        create_windows_shortcut(installed_exe, desktop_shortcut, icon_file)
+        create_windows_shortcut(installed_exe, start_menu_shortcut, icon_file)
+
+    window = MainWindow(app_mode=selected_mode, config_dir=config_dir, install_dir=target_install_dir)
     window.show()
     sys.exit(app.exec())
