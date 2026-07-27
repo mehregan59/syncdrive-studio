@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 class SyncMode(str, Enum):
     ONE_WAY_MIRROR = "one_way_mirror"  # Target becomes exact replica of source (deletes target extra files)
     ONE_WAY_BACKUP = "one_way_backup"  # Copies new/updated files to target (never deletes)
-    TWO_WAY_SYNC = "two_way_sync"      # Syncs changes bidirectionally between source and targets
+    TWO_WAY_SYNC = "two_way_sync"      # Bidirectional sync between source and target
 
 
 class ConflictPolicy(str, Enum):
@@ -19,8 +19,9 @@ class ConflictPolicy(str, Enum):
 
 class ScheduleType(str, Enum):
     MANUAL = "manual"
-    INTERVAL = "interval"
-    ON_DRIVE_CONNECT = "on_drive_connect"
+    INTERVAL = "interval"                  # Fixed interval (e.g. every X minutes)
+    ON_DRIVE_CONNECT = "on_drive_connect"  # Trigger when target USB drive is attached
+    ON_FILE_CHANGE = "on_file_change"      # Smart low-resource OS kernel watcher
 
 
 class SyncAction(BaseModel):
@@ -38,7 +39,8 @@ class SyncJob(BaseModel):
     mode: SyncMode = SyncMode.ONE_WAY_BACKUP
     conflict_policy: ConflictPolicy = ConflictPolicy.KEEP_NEWEST
     schedule_type: ScheduleType = ScheduleType.MANUAL
-    schedule_value: Optional[str] = None
+    interval_minutes: int = 30             # Default repeat interval
+    debounce_seconds: int = 5              # Cooldown buffer for smart change watcher
     target_drive_volume_label: Optional[str] = None
     exclude_patterns: List[str] = [
         ".tmp",
