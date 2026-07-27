@@ -9,7 +9,6 @@ import pathlib
 from enum import Enum
 from typing import List, Callable
 
-# List of required packages
 REQUIRED_PACKAGES = {
     "PyQt6": "PyQt6",
     "pydantic": "pydantic",
@@ -59,7 +58,6 @@ from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
 from engine import SyncEngine
 from drive_detector import DriveWatcherThread
 
-# Safe Watchdog Import
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
@@ -70,7 +68,6 @@ except ImportError:
 
 if WATCHDOG_AVAILABLE:
     class SmartChangeHandler(FileSystemEventHandler):
-        """Listens for OS file change events and debounces them to protect drives."""
         def __init__(self, callback: Callable[[], None], debounce_seconds: int = 5):
             super().__init__()
             self.callback = callback
@@ -143,7 +140,6 @@ class AppMode(str, Enum):
 
 
 def create_windows_shortcut(target_exe: pathlib.Path, shortcut_path: pathlib.Path, icon_path: pathlib.Path = None):
-    """Creates a Windows .lnk shortcut automatically using VBScript."""
     if not sys.platform.startswith("win"):
         return
 
@@ -192,7 +188,7 @@ class SetupWizardDialog(QDialog):
         disc_text.setReadOnly(True)
         disc_text.setText(
             "DISCLAIMER OF LIABILITY:\n\n"
-            "SyncDrive Studio is free, open-source software created solely for personal and utility use. "
+            "SyncDrive Studio is free software created solely for personal and utility use. "
             "This software is provided 'AS-IS', WITHOUT WARRANTY OF ANY KIND, express or implied, including "
             "but not limited to the warranties of merchantability, fitness for a particular purpose, or non-infringement.\n\n"
             "In no event shall the author or copyright holders be liable for any claim, damages, data loss, "
@@ -266,7 +262,6 @@ class SetupWizardDialog(QDialog):
         self.custom_install_path = self.path_input.text().strip()
         self.confirm_btn.setEnabled(False)
 
-        # Simulate visual installation progress bar
         for i in range(1, 101):
             time.sleep(0.015)
             self.install_progress.setValue(i)
@@ -565,6 +560,10 @@ class MainWindow(QMainWindow):
             desktop_link.unlink(missing_ok=True)
             start_link.unlink(missing_ok=True)
 
+            # Reset saved mode flag so setup wizard appears on next run
+            mode_file = self.config_dir.parent / ".app_mode"
+            mode_file.unlink(missing_ok=True)
+
             if self.config_dir.exists():
                 shutil.rmtree(self.config_dir, ignore_errors=True)
 
@@ -658,6 +657,7 @@ if __name__ == "__main__":
     selected_mode = None
     target_install_dir = None
 
+    # Always trigger Setup Wizard if .app_mode does not exist
     if mode_file.exists():
         selected_mode = AppMode.PORTABLE if mode_file.read_text().strip() == AppMode.PORTABLE.value else AppMode.INSTALLED
     else:
