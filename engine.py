@@ -52,7 +52,6 @@ class SyncEngine:
                 if not dst_root.exists():
                     continue
 
-                # 1. Source -> Target sync check
                 for root, _, files in os.walk(src_root):
                     rel_path = Path(root).relative_to(src_root)
                     dst_dir = dst_root / rel_path
@@ -84,7 +83,6 @@ class SyncEngine:
                                         reason=f"Conflict resolved via policy: {job.conflict_policy.value}"
                                     ))
 
-                # 2. Target -> Source sync check (Two-Way Sync)
                 if job.mode == SyncMode.TWO_WAY_SYNC:
                     for root, _, files in os.walk(dst_root):
                         rel_path = Path(root).relative_to(dst_root)
@@ -105,7 +103,6 @@ class SyncEngine:
                                     reason="File missing in source (Two-Way Sync)"
                                 ))
 
-                # 3. Handle Extra Target Files (One-Way Mirror Mode)
                 elif job.mode == SyncMode.ONE_WAY_MIRROR:
                     for root, _, files in os.walk(dst_root):
                         rel_path = Path(root).relative_to(dst_root)
