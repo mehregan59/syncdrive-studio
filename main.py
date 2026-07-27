@@ -51,9 +51,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QLabel, QTextEdit, QCheckBox, QComboBox,
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
-    QProgressBar, QFileDialog, QGroupBox, QRadioButton, QSpinBox, QFrame
+    QProgressBar, QFileDialog, QGroupBox, QRadioButton, QSpinBox, QFrame,
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QSplitter
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
 from PyQt6.QtGui import QIcon, QColor
 from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
 from engine import SyncEngine
@@ -67,59 +68,54 @@ except ImportError:
     WATCHDOG_AVAILABLE = False
 
 
+class WatchdogSignalBridge(QObject):
+    file_changed = pyqtSignal(str)
+
+
 if WATCHDOG_AVAILABLE:
-    class SmartChangeHandler(FileSystemEventHandler):
-        def __init__(self, callback: Callable[[], None], debounce_seconds: int = 5):
+    class RobustChangeHandler(FileSystemEventHandler):
+        def __init__(self, bridge: WatchdogSignalBridge, debounce_seconds: int = 3):
             super().__init__()
-            self.callback = callback
+            self.bridge = bridge
             self.debounce_seconds = debounce_seconds
             self.last_event_time = 0
 
         def on_any_event(self, event):
-            if event.is_directory:
+            if event.is_directory or "$RECYCLE.BIN" in event.src_path or event.src_path.endswith(".tmp"):
                 return
+            
             current_time = time.time()
             if current_time - self.last_event_time > self.debounce_seconds:
                 self.last_event_time = current_time
-                self.callback()
+                self.bridge.file_changed.emit(f"Change detected: {os.path.basename(event.src_path)}")
 
-    class SmartFolderWatcherThread(QThread):
-        change_detected = pyqtSignal(str)
-
-        def __init__(self, watch_paths: List[str], debounce_seconds: int = 5):
-            super().__init__()
+    class SmartFolderWatcherManager:
+        def __init__(self, watch_paths: List[str], callback: Callable[[str], None], debounce_seconds: int = 3):
             self.watch_paths = watch_paths
-            self.debounce_seconds = debounce_seconds
+            self.callback = callback
+            self.bridge = WatchdogSignalBridge()
+            self.bridge.file_changed.connect(self.callback)
+            
+            self.handler = RobustChangeHandler(self.bridge, debounce_seconds=debounce_seconds)
             self.observer = Observer()
 
-        def run(self):
-            handler = SmartChangeHandler(
-                callback=self._on_change_triggered,
-                debounce_seconds=self.debounce_seconds
-            )
+        def start(self):
             for path_str in self.watch_paths:
-                try:
-                    self.observer.schedule(handler, path=path_str, recursive=True)
-                except Exception as e:
-                    print(f"Unable to watch path {path_str}: {e}")
-
+                clean_path = os.path.abspath(os.path.normpath(path_str))
+                if os.path.exists(clean_path):
+                    try:
+                        self.observer.schedule(self.handler, path=clean_path, recursive=True)
+                    except Exception as e:
+                        print(f"Error watching path '{clean_path}': {e}")
             self.observer.start()
-            try:
-                while self.observer.is_alive():
-                    time.sleep(1)
-            finally:
+
+        def stop(self):
+            if self.observer.is_alive():
                 self.observer.stop()
                 self.observer.join()
 
-        def _on_change_triggered(self):
-            self.change_detected.emit("Smart file change event detected (debounced)")
 
-        def stop(self):
-            self.observer.stop()
-            self.wait()
-
-
-DASHBOARD_STYLESHEET = """
+GOODSYNC_STUDIO_STYLESHEET = """
 QMainWindow {
     background-color: #12131C;
 }
@@ -127,85 +123,91 @@ QMainWindow {
 QWidget {
     color: #E2E4F0;
     font-family: 'Segoe UI', 'SF Pro Display', sans-serif;
+    font-size: 12px;
+}
+
+/* Top Toolbar Ribbon */
+#ToolbarFrame {
+    background-color: #1E1F2E;
+    border-bottom: 1px solid #28293D;
+    padding: 6px;
+}
+
+QPushButton#RibbonBtn {
+    background-color: #28293D;
+    color: #FFFFFF;
+    border: 1px solid #3B3C54;
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-weight: bold;
     font-size: 13px;
 }
 
-#SidebarFrame {
+QPushButton#RibbonBtn:hover {
     background-color: #6C5CE7;
-    border-top-right-radius: 20px;
-    border-bottom-right-radius: 20px;
+    border-color: #7D6EEB;
 }
 
-#NavButton {
-    background-color: transparent;
-    color: #D6D0F8;
-    border: none;
-    border-radius: 12px;
-    padding: 12px;
-    font-size: 16px;
-    text-align: left;
-}
-
-#NavButton:hover {
-    background-color: #5B4BC4;
-    color: #FFFFFF;
-}
-
-#DashboardCard {
-    background-color: #1E1F2E;
-    border-radius: 16px;
-    padding: 16px;
-    border: 1px solid #28293D;
-}
-
-QPushButton#PrimaryBtn {
+QPushButton#RibbonBtnPrimary {
     background-color: #6C5CE7;
     color: #FFFFFF;
     border: none;
-    border-radius: 10px;
-    padding: 10px 18px;
+    border-radius: 8px;
+    padding: 8px 18px;
     font-weight: bold;
+    font-size: 13px;
 }
 
-QPushButton#PrimaryBtn:hover {
+QPushButton#RibbonBtnPrimary:hover {
     background-color: #7D6EEB;
 }
 
-QPushButton#DangerBtn {
-    background-color: #E74C3C;
-    color: #FFFFFF;
-    border: none;
+/* Connection Header Bar */
+#ConnectionHeader {
+    background-color: #171824;
     border-radius: 10px;
-    padding: 10px 18px;
+    padding: 8px 14px;
+    border: 1px solid #28293D;
+}
+
+/* Card Containers */
+#DashboardCard {
+    background-color: #1E1F2E;
+    border-radius: 12px;
+    border: 1px solid #28293D;
+}
+
+/* Trees & Tables */
+QTreeWidget, QListWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox {
+    background-color: #171824;
+    border: 1px solid #2B2C42;
+    border-radius: 8px;
+    padding: 4px;
+    color: #FFFFFF;
+}
+
+QHeaderView::section {
+    background-color: #1E1F2E;
+    color: #8E8EA8;
+    padding: 6px;
+    border: none;
     font-weight: bold;
 }
 
-QPushButton#DangerBtn:hover {
-    background-color: #FF5252;
+QTreeWidget::item {
+    padding: 6px;
+    border-bottom: 1px solid #1E1F2E;
 }
 
-QLineEdit, QComboBox, QSpinBox, QListWidget, QTextEdit {
-    background-color: #171824;
-    border: 1px solid #2B2C42;
-    border-radius: 10px;
-    padding: 8px 12px;
-    color: #FFFFFF;
-}
-
-QListWidget::item {
-    border-radius: 8px;
-    padding: 8px;
-    margin-bottom: 4px;
-}
-
-QListWidget::item:selected {
+QTreeWidget::item:selected, QListWidget::item:selected {
     background-color: #6C5CE7;
     color: #FFFFFF;
 }
 
+/* Progress Bar */
 QProgressBar {
     border: none;
-    border-radius: 8px;
+    border-radius: 6px;
     background-color: #171824;
     text-align: center;
     color: white;
@@ -214,7 +216,7 @@ QProgressBar {
 
 QProgressBar::chunk {
     background-color: #00B894;
-    border-radius: 8px;
+    border-radius: 6px;
 }
 
 QToolTip {
@@ -222,8 +224,7 @@ QToolTip {
     color: #FFFFFF;
     border: 1px solid #6C5CE7;
     border-radius: 6px;
-    padding: 8px;
-    font-size: 12px;
+    padding: 6px;
 }
 """
 
@@ -259,16 +260,16 @@ def create_windows_shortcut(target_exe: pathlib.Path, shortcut_path: pathlib.Pat
 class SetupWizardDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SyncDrive Studio - Installation Wizard")
-        self.setFixedSize(580, 520)
-        self.setStyleSheet(DASHBOARD_STYLESHEET)
+        self.setWindowTitle("SyncDrive Studio - Setup Wizard")
+        self.setFixedSize(580, 500)
+        self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
         
         self.selected_mode = AppMode.PORTABLE
         self.custom_install_path = str(pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio")
 
         layout = QVBoxLayout(self)
         title = QLabel("Welcome to SyncDrive Studio Setup")
-        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #6C5CE7;")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #6C5CE7;")
         layout.addWidget(title)
 
         disc_group = QGroupBox("⚠️ License & Legal Disclaimer")
@@ -277,9 +278,9 @@ class SetupWizardDialog(QDialog):
         disc_text.setReadOnly(True)
         disc_text.setText(
             "DISCLAIMER OF LIABILITY:\n\n"
-            "SyncDrive Studio is free software provided 'AS-IS' for personal use.\n"
-            "The author accepts no responsibility or liability for data loss or hardware issues.\n"
-            "By accepting and continuing, you use this software at your own risk."
+            "SyncDrive Studio is free utility software provided 'AS-IS' for personal use.\n"
+            "The author holds no liability for data loss or hardware issues.\n"
+            "By checking accept, you use this application at your own risk."
         )
         disc_text.setMaximumHeight(100)
         disc_box.addWidget(disc_text)
@@ -291,7 +292,7 @@ class SetupWizardDialog(QDialog):
 
         mode_group = QGroupBox("Deployment Mode")
         mode_box = QVBoxLayout(mode_group)
-        self.radio_portable = QRadioButton("📁 Portable Mode (Run directly from current folder/USB)")
+        self.radio_portable = QRadioButton("📁 Portable Mode (No system installation)")
         self.radio_portable.setChecked(True)
         self.radio_portable.toggled.connect(self.toggle_location_box)
 
@@ -314,13 +315,13 @@ class SetupWizardDialog(QDialog):
         prog_box = QVBoxLayout(self.prog_group)
         self.install_progress = QProgressBar()
         self.install_progress.setValue(0)
-        self.status_lbl = QLabel("Status: Waiting for user action...")
+        self.status_lbl = QLabel("Status: Waiting for confirmation...")
         prog_box.addWidget(self.install_progress)
         prog_box.addWidget(self.status_lbl)
         layout.addWidget(self.prog_group)
 
         self.confirm_btn = QPushButton("Install & Launch")
-        self.confirm_btn.setObjectName("PrimaryBtn")
+        self.confirm_btn.setObjectName("RibbonBtnPrimary")
         self.confirm_btn.setEnabled(False)
         self.confirm_btn.clicked.connect(self.start_installation)
         layout.addWidget(self.confirm_btn)
@@ -345,8 +346,8 @@ class SetupWizardDialog(QDialog):
         for i in range(1, 101):
             time.sleep(0.015)
             self.install_progress.setValue(i)
-            if i == 30: self.status_lbl.setText("Status: Preparing target environment...")
-            elif i == 70: self.status_lbl.setText("Status: Writing application binaries...")
+            if i == 30: self.status_lbl.setText("Status: Preparing target location...")
+            elif i == 70: self.status_lbl.setText("Status: Extracting binaries...")
             QApplication.processEvents()
 
         self.status_lbl.setText("Status: Installation Complete!")
@@ -356,6 +357,7 @@ class SetupWizardDialog(QDialog):
 
 class SyncWorker(QThread):
     progress_update = pyqtSignal(int, str)
+    action_item_signal = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(list)
 
@@ -370,24 +372,29 @@ class SyncWorker(QThread):
             actions = self.engine.plan_job(self.job)
             total = len(actions)
 
-            if self.dry_run or total == 0:
-                self.finished_signal.emit(actions)
-                return
-
             for idx, action in enumerate(actions, 1):
-                pct = int((idx / total) * 100)
+                pct = int((idx / total) * 100) if total > 0 else 100
                 msg = f"[{action.action_type}] {action.target_path or action.source_path}"
 
-                if action.action_type == "COPY_TO_TARGET":
-                    d = pathlib.Path(action.target_path)
-                    d.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(action.source_path, d)
-                elif action.action_type == "COPY_TO_SOURCE":
-                    s = pathlib.Path(action.source_path)
-                    s.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(action.target_path, s)
-                elif action.action_type == "DELETE_TARGET":
-                    pathlib.Path(action.target_path).unlink(missing_ok=True)
+                # Emit to Diff Tree View
+                self.action_item_signal.emit({
+                    "action_type": action.action_type,
+                    "source": action.source_path or "-",
+                    "target": action.target_path or "-",
+                    "reason": action.reason
+                })
+
+                if not self.dry_run:
+                    if action.action_type == "COPY_TO_TARGET":
+                        d = pathlib.Path(action.target_path)
+                        d.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(action.source_path, d)
+                    elif action.action_type == "COPY_TO_SOURCE":
+                        s = pathlib.Path(action.source_path)
+                        s.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(action.target_path, s)
+                    elif action.action_type == "DELETE_TARGET":
+                        pathlib.Path(action.target_path).unlink(missing_ok=True)
 
                 self.progress_update.emit(pct, msg)
 
@@ -399,55 +406,55 @@ class SyncWorker(QThread):
 class ModernJobDialog(QDialog):
     def __init__(self, parent=None, job: SyncJob = None):
         super().__init__(parent)
-        self.setWindowTitle("Configure Sync Job")
-        self.resize(620, 480)
-        self.setStyleSheet(DASHBOARD_STYLESHEET)
+        self.setWindowTitle("Configure Sync Task")
+        self.resize(600, 460)
+        self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
         self.job = job
 
         layout = QVBoxLayout(self)
 
-        top_group = QGroupBox("Configuration")
+        top_group = QGroupBox("General Options")
         top_layout = QFormLayout(top_group)
 
-        self.name_input = QLineEdit(job.name if job else "New Sync Job")
-        top_layout.addRow("Job Name:", self.name_input)
+        self.name_input = QLineEdit(job.name if job else "New Sync Task")
+        top_layout.addRow("Task Name:", self.name_input)
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([m.value for m in SyncMode])
         if job: self.mode_combo.setCurrentText(job.mode.value)
-        top_layout.addRow("Behavior:", self.mode_combo)
+        top_layout.addRow("Sync Mode:", self.mode_combo)
 
         self.schedule_combo = QComboBox()
         self.schedule_combo.addItems([s.value for s in ScheduleType])
         if job: self.schedule_combo.setCurrentText(job.schedule_type.value)
         self.schedule_combo.currentTextChanged.connect(self.toggle_trigger_options)
-        top_layout.addRow("Schedule:", self.schedule_combo)
+        top_layout.addRow("Trigger Strategy:", self.schedule_combo)
 
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 1440)
         self.interval_spin.setValue(job.interval_minutes if job else 30)
         self.interval_spin.setSuffix(" Minutes")
-        top_layout.addRow("Interval:", self.interval_spin)
+        top_layout.addRow("Repeat Interval:", self.interval_spin)
 
         layout.addWidget(top_group)
 
         drive_section = QHBoxLayout()
 
-        src_group = QGroupBox("Sources")
+        src_group = QGroupBox("Left Side (Source)")
         src_box = QVBoxLayout(src_group)
         self.src_input = QLineEdit(", ".join(job.sources) if job else "")
-        src_browse = QPushButton("📁 Browse Source")
-        src_browse.setObjectName("PrimaryBtn")
+        src_browse = QPushButton("📁 Select Source")
+        src_browse.setObjectName("RibbonBtn")
         src_browse.clicked.connect(self.browse_source)
         src_box.addWidget(self.src_input)
         src_box.addWidget(src_browse)
         drive_section.addWidget(src_group)
 
-        dst_group = QGroupBox("Targets")
+        dst_group = QGroupBox("Right Side (Target)")
         dst_box = QVBoxLayout(dst_group)
         self.dst_input = QLineEdit(", ".join(job.targets) if job else "")
-        dst_browse = QPushButton("💾 Browse Target")
-        dst_browse.setObjectName("PrimaryBtn")
+        dst_browse = QPushButton("💾 Select Target")
+        dst_browse.setObjectName("RibbonBtn")
         dst_browse.clicked.connect(self.browse_target)
         dst_box.addWidget(self.dst_input)
         dst_box.addWidget(dst_browse)
@@ -473,7 +480,7 @@ class ModernJobDialog(QDialog):
             self.src_input.setText(", ".join(current))
 
     def browse_target(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Target Directory")
+        folder = QFileDialog.getExistingDirectory(self, "Select Target Folder")
         if folder:
             current = [t.strip().strip('"').strip("'") for t in self.dst_input.text().split(",") if t.strip()]
             current.append(folder)
@@ -514,9 +521,9 @@ class MainWindow(QMainWindow):
         self.app_mode = app_mode
         self.config_dir = config_dir
         self.install_dir = install_dir
-        self.setWindowTitle(f"SyncDrive Studio - [{self.app_mode.value.upper()} MODE]")
-        self.resize(1100, 700)
-        self.setStyleSheet(DASHBOARD_STYLESHEET)
+        self.setWindowTitle(f"SyncDrive Studio - GoodSync Style [{self.app_mode.value.upper()}]")
+        self.resize(1150, 720)
+        self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
 
         icon_path = (self.install_dir or config_dir) / "app_icon.ico"
         if icon_path.exists():
@@ -525,7 +532,7 @@ class MainWindow(QMainWindow):
         self.engine = SyncEngine()
         self.jobs = [
             SyncJob(
-                name="Smart Backup",
+                name="Smart Photo Backup",
                 sources=["C:/Data"],
                 targets=["E:/BackupDrive"],
                 mode=SyncMode.ONE_WAY_BACKUP,
@@ -536,181 +543,157 @@ class MainWindow(QMainWindow):
 
         self.smart_watchers = []
         self.init_ui()
-        self.refresh_job_list()
+        self.refresh_job_tree()
         self.init_drive_watcher()
         self.init_timers_and_smart_watchers()
 
     def init_ui(self):
         main_widget = QWidget()
-        main_layout = QHBoxLayout(main_widget)
-        main_layout.setContentsMargins(0, 0, 16, 16)
-        main_layout.setSpacing(16)
+        layout = QVBoxLayout(main_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        sidebar_frame = QFrame()
-        sidebar_frame.setObjectName("SidebarFrame")
-        sidebar_frame.setFixedWidth(80)
-        sidebar_layout = QVBoxLayout(sidebar_frame)
-        sidebar_layout.setContentsMargins(12, 24, 12, 24)
+        # ---------------- 1. Top Ribbon Toolbar (GoodSync Style) ----------------
+        toolbar = QFrame()
+        toolbar.setObjectName("ToolbarFrame")
+        tb_layout = QHBoxLayout(toolbar)
 
-        logo_lbl = QLabel("⚡")
-        logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo_lbl.setStyleSheet("font-size: 28px; margin-bottom: 20px;")
-        sidebar_layout.addWidget(logo_lbl)
+        btn_new = QPushButton("➕ New Job")
+        btn_new.setObjectName("RibbonBtn")
+        btn_new.clicked.connect(self.add_job)
+        tb_layout.addWidget(btn_new)
 
-        btn_dashboard = QPushButton("📊")
-        btn_dashboard.setObjectName("NavButton")
-        btn_dashboard.setToolTip("Dashboard Overview")
-        sidebar_layout.addWidget(btn_dashboard)
+        btn_edit = QPushButton("✏️ Edit Task")
+        btn_edit.setObjectName("RibbonBtn")
+        btn_edit.clicked.connect(self.edit_job)
+        tb_layout.addWidget(btn_edit)
 
-        btn_jobs = QPushButton("⚡")
-        btn_jobs.setObjectName("NavButton")
-        btn_jobs.setToolTip("Active Sync Jobs")
-        sidebar_layout.addWidget(btn_jobs)
+        btn_del = QPushButton("🗑️ Delete")
+        btn_del.setObjectName("RibbonBtn")
+        btn_del.clicked.connect(self.delete_job)
+        tb_layout.addWidget(btn_del)
 
-        sidebar_layout.addStretch()
+        tb_layout.addSpacing(20)
 
-        btn_uninstall = QPushButton("🗑️")
-        btn_uninstall.setObjectName("NavButton")
-        btn_uninstall.setToolTip("Uninstall Application")
-        btn_uninstall.clicked.connect(self.run_uninstall)
-        sidebar_layout.addWidget(btn_uninstall)
+        self.btn_analyze = QPushButton("🔍 Analyze (Preview)")
+        self.btn_analyze.setObjectName("RibbonBtnPrimary")
+        self.btn_analyze.clicked.connect(lambda: self.run_job(force_dry_run=True))
+        tb_layout.addWidget(self.btn_analyze)
 
-        main_layout.addWidget(sidebar_frame)
+        self.btn_sync = QPushButton("🔄 Sync Now")
+        self.btn_sync.setObjectName("RibbonBtnPrimary")
+        self.btn_sync.setStyleSheet("background-color: #00B894;")
+        self.btn_sync.clicked.connect(lambda: self.run_job(force_dry_run=False))
+        tb_layout.addWidget(self.btn_sync)
 
-        content_layout = QVBoxLayout()
-        content_layout.setContentsMargins(10, 20, 10, 10)
+        tb_layout.addSpacing(20)
 
-        header_lbl = QLabel("Sync Engine Dashboard")
-        header_lbl.setStyleSheet("font-size: 24px; font-weight: bold; color: #FFFFFF; margin-bottom: 10px;")
-        content_layout.addWidget(header_lbl)
+        self.dry_run_cb = QCheckBox("Dry-Run Check")
+        self.dry_run_cb.setToolTip("Scans drive differences without performing file changes.")
+        tb_layout.addWidget(self.dry_run_cb)
 
-        metrics_row = QHBoxLayout()
-
-        card1 = QFrame()
-        card1.setObjectName("DashboardCard")
-        c1_box = QVBoxLayout(card1)
-        c1_title = QLabel("Active Jobs")
-        c1_title.setStyleSheet("color: #8E8EA8; font-size: 11px;")
-        self.c1_val = QLabel("1 Active")
-        self.c1_val.setStyleSheet("font-size: 20px; font-weight: bold; color: #6C5CE7;")
-        c1_box.addWidget(c1_title)
-        c1_box.addWidget(self.c1_val)
-        metrics_row.addWidget(card1)
-
-        card2 = QFrame()
-        card2.setObjectName("DashboardCard")
-        c2_box = QVBoxLayout(card2)
-        c2_title = QLabel("Engine Status")
-        c2_title.setStyleSheet("color: #8E8EA8; font-size: 11px;")
-        self.c2_val = QLabel("Idle / Ready")
-        self.c2_val.setStyleSheet("font-size: 18px; font-weight: bold; color: #00B894;")
-        c2_box.addWidget(c2_title)
-        c2_box.addWidget(self.c2_val)
-        metrics_row.addWidget(card2)
-
-        card3 = QFrame()
-        card3.setObjectName("DashboardCard")
-        c3_box = QVBoxLayout(card3)
-        c3_title = QLabel("Deployment Mode")
-        c3_title.setStyleSheet("color: #8E8EA8; font-size: 11px;")
-        c3_val = QLabel(self.app_mode.value.capitalize())
-        c3_val.setStyleSheet("font-size: 18px; font-weight: bold; color: #E17055;")
-        c3_box.addWidget(c3_title)
-        c3_box.addWidget(c3_val)
-        metrics_row.addWidget(card3)
-
-        content_layout.addLayout(metrics_row)
-
-        split_layout = QHBoxLayout()
-
-        jobs_card = QFrame()
-        jobs_card.setObjectName("DashboardCard")
-        jc_box = QVBoxLayout(jobs_card)
-
-        jc_title = QLabel("Registered Sync Tasks")
-        jc_title.setStyleSheet("font-weight: bold; font-size: 15px; color: #FFFFFF;")
-        jc_box.addWidget(jc_title)
-
-        self.job_list = QListWidget()
-        self.job_list.currentRowChanged.connect(self.on_job_selected)
-        jc_box.addWidget(self.job_list)
-
-        btn_row = QHBoxLayout()
-        add_btn = QPushButton("+ Add")
-        add_btn.setObjectName("PrimaryBtn")
-        add_btn.clicked.connect(self.add_job)
-
-        edit_btn = QPushButton("Edit")
-        edit_btn.setObjectName("PrimaryBtn")
-        edit_btn.clicked.connect(self.edit_job)
-
-        del_btn = QPushButton("Delete")
-        del_btn.setObjectName("DangerBtn")
-        del_btn.clicked.connect(self.delete_job)
-
-        btn_row.addWidget(add_btn)
-        btn_row.addWidget(edit_btn)
-        btn_row.addWidget(del_btn)
-        jc_box.addLayout(btn_row)
-
-        split_layout.addWidget(jobs_card, 1)
-
-        dash_card = QFrame()
-        dash_card.setObjectName("DashboardCard")
-        dc_box = QVBoxLayout(dash_card)
-
-        dc_title = QLabel("Execution Monitor")
-        dc_title.setStyleSheet("font-weight: bold; font-size: 15px; color: #FFFFFF;")
-        dc_box.addWidget(dc_title)
+        tb_layout.addStretch()
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(20)
-        dc_box.addWidget(self.progress_bar)
+        self.progress_bar.setFixedWidth(180)
+        self.progress_bar.setFixedHeight(18)
+        tb_layout.addWidget(self.progress_bar)
 
-        ctrl_row = QHBoxLayout()
-        self.dry_run_cb = QCheckBox("Dry-Run Mode (Simulation)")
+        layout.addWidget(toolbar)
+
+        # ---------------- 2. Source <-> Target Connector Header ----------------
+        conn_frame = QFrame()
+        conn_frame.setObjectName("ConnectionHeader")
+        conn_layout = QHBoxLayout(conn_frame)
+
+        self.src_lbl = QLabel("📁 Source: (Select a job)")
+        self.src_lbl.setStyleSheet("font-weight: bold; color: #00ADB5;")
         
-        # --- Hover Tooltip for Dry-Run Mode ---
-        self.dry_run_cb.setToolTip(
-            "<b>Simulation Mode:</b><br>"
-            "Scans drives and logs planned file copies or deletions without making any actual changes to your disk.<br>"
-            "Use this to safely test sync rules before executing live updates."
-        )
-        ctrl_row.addWidget(self.dry_run_cb)
+        arrow_lbl = QLabel(" ↔ ")
+        arrow_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #6C5CE7;")
 
-        self.run_btn = QPushButton("▶ Run Selected Job")
-        self.run_btn.setObjectName("PrimaryBtn")
-        self.run_btn.clicked.connect(self.run_job)
-        ctrl_row.addWidget(self.run_btn)
-        dc_box.addLayout(ctrl_row)
+        self.dst_lbl = QLabel("💾 Target: (Select a job)")
+        self.dst_lbl.setStyleSheet("font-weight: bold; color: #00B894;")
 
-        log_lbl = QLabel("Realtime Activity Log")
-        log_lbl.setStyleSheet("color: #8E8EA8; margin-top: 10px;")
-        dc_box.addWidget(log_lbl)
+        conn_layout.addWidget(self.src_lbl)
+        conn_layout.addWidget(arrow_lbl)
+        conn_layout.addWidget(self.dst_lbl)
+        conn_layout.addStretch()
 
+        layout.addWidget(conn_frame)
+
+        # ---------------- 3. Main Split View (Job Tree + Diff View) ----------------
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left Panel: GoodSync Task List Tree
+        self.job_tree = QTreeWidget()
+        self.job_tree.setHeaderLabel("All Sync Jobs")
+        self.job_tree.setFixedWidth(220)
+        self.job_tree.currentItemChanged.connect(self.on_job_tree_selected)
+        splitter.addWidget(self.job_tree)
+
+        # Right Center Panel: Differential Comparison Tree Table
+        right_container = QWidget()
+        rc_layout = QVBoxLayout(right_container)
+        rc_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.diff_tree = QTreeWidget()
+        self.diff_tree.setHeaderLabels(["Action Item / File", "Left Source", "Direction", "Right Target", "Status"])
+        self.diff_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.diff_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.diff_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.diff_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.diff_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        rc_layout.addWidget(self.diff_tree)
+
+        # Bottom Realtime Log Output
         self.log_output = QTextEdit()
+        self.log_output.setFixedHeight(120)
         self.log_output.setReadOnly(True)
-        dc_box.addWidget(self.log_output)
+        rc_layout.addWidget(self.log_output)
 
-        split_layout.addWidget(dash_card, 2)
+        splitter.addWidget(right_container)
+        splitter.setSizes([220, 930])
 
-        content_layout.addLayout(split_layout)
-        main_layout.addLayout(content_layout)
-
+        layout.addWidget(splitter)
         self.setCentralWidget(main_widget)
 
-    def refresh_job_list(self):
-        self.job_list.clear()
-        for j in self.jobs:
-            self.job_list.addItem(f"⚡ {j.name} [{j.schedule_type.value}]")
-        if self.jobs:
-            self.job_list.setCurrentRow(0)
-        self.c1_val.setText(f"{len(self.jobs)} Configured")
+    def refresh_job_tree(self):
+        self.job_tree.clear()
+        
+        backup_node = QTreeWidgetItem(self.job_tree, ["📁 One-Way Backup Tasks"])
+        mirror_node = QTreeWidgetItem(self.job_tree, ["🪞 Mirror Tasks"])
+        twoway_node = QTreeWidgetItem(self.job_tree, ["🔄 Bidirectional Tasks"])
 
-    def on_job_selected(self, index: int):
-        if 0 <= index < len(self.jobs):
-            job = self.jobs[index]
-            self.log_output.append(f"ℹ️ Job Selected: '{job.name}' | Trigger: {job.schedule_type.value}")
+        for job in self.jobs:
+            text = f"⚡ {job.name}"
+            if job.mode == SyncMode.ONE_WAY_BACKUP:
+                item = QTreeWidgetItem(backup_node, [text])
+            elif job.mode == SyncMode.ONE_WAY_MIRROR:
+                item = QTreeWidgetItem(mirror_node, [text])
+            else:
+                item = QTreeWidgetItem(twoway_node, [text])
+            item.setData(0, Qt.ItemDataRole.UserRole, job.id)
+
+        self.job_tree.expandAll()
+
+    def get_selected_job(self) -> SyncJob:
+        item = self.job_tree.currentItem()
+        if item and item.data(0, Qt.ItemDataRole.UserRole):
+            job_id = item.data(0, Qt.ItemDataRole.UserRole)
+            for j in self.jobs:
+                if j.id == job_id:
+                    return j
+        return self.jobs[0] if self.jobs else None
+
+    def on_job_tree_selected(self, current, previous):
+        job = self.get_selected_job()
+        if job:
+            src_str = ", ".join(job.sources) if job.sources else "None"
+            dst_str = ", ".join(job.targets) if job.targets else "None"
+            self.src_lbl.setText(f"📁 Source: {src_str}")
+            self.dst_lbl.setText(f"💾 Target: {dst_str}")
+            self.log_output.append(f"ℹ️ Selected task: '{job.name}' [{job.mode.value}]")
 
     def add_job(self):
         dialog = ModernJobDialog(self)
@@ -718,53 +701,37 @@ class MainWindow(QMainWindow):
             new_job = dialog.get_job()
             if new_job:
                 self.jobs.append(new_job)
-                self.refresh_job_list()
+                self.refresh_job_tree()
                 self.init_timers_and_smart_watchers()
 
     def edit_job(self):
-        idx = self.job_list.currentRow()
-        if idx >= 0:
-            dialog = ModernJobDialog(self, job=self.jobs[idx])
+        job = self.get_selected_job()
+        if job:
+            dialog = ModernJobDialog(self, job=job)
             if dialog.exec():
                 updated_job = dialog.get_job()
                 if updated_job:
+                    idx = self.jobs.index(job)
                     self.jobs[idx] = updated_job
-                    self.refresh_job_list()
+                    self.refresh_job_tree()
                     self.init_timers_and_smart_watchers()
 
     def delete_job(self):
-        idx = self.job_list.currentRow()
-        if idx >= 0:
-            del self.jobs[idx]
-            self.refresh_job_list()
+        job = self.get_selected_job()
+        if job:
+            self.jobs.remove(job)
+            self.refresh_job_tree()
             self.init_timers_and_smart_watchers()
-
-    def run_uninstall(self):
-        reply = QMessageBox.warning(
-            self,
-            "Uninstall Software",
-            "Are you sure you want to uninstall SyncDrive Studio?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            desktop_link = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
-            start_link = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
-            desktop_link.unlink(missing_ok=True)
-            start_link.unlink(missing_ok=True)
-
-            mode_file = self.config_dir.parent / ".app_mode"
-            mode_file.unlink(missing_ok=True)
-
-            if self.config_dir.exists():
-                shutil.rmtree(self.config_dir, ignore_errors=True)
-
-            QMessageBox.information(self, "Uninstalled", "Application removed cleanly.")
-            self.close()
 
     def init_drive_watcher(self):
         self.watcher = DriveWatcherThread()
         self.watcher.drive_connected.connect(self.on_drive_plugged_in)
         self.watcher.start()
+
+    def _create_change_callback(self, job: SyncJob):
+        def _callback(msg: str):
+            self.on_smart_change(job, msg)
+        return _callback
 
     def init_timers_and_smart_watchers(self):
         for w in self.smart_watchers:
@@ -780,53 +747,67 @@ class MainWindow(QMainWindow):
                 interval_ms = job.interval_minutes * 60 * 1000
                 timer.timeout.connect(lambda j=job: self.execute_job_instance(j, dry_run=False))
                 timer.start(interval_ms)
-                self.log_output.append(f"⏱️ Timer Active: '{job.name}' ({job.interval_minutes}m)")
+                self.log_output.append(f"⏱️ Scheduled timer: '{job.name}' ({job.interval_minutes}m)")
 
             elif job.schedule_type == ScheduleType.ON_FILE_CHANGE and WATCHDOG_AVAILABLE:
-                valid_paths = [p for p in job.sources if pathlib.Path(p).exists()]
+                valid_paths = [os.path.abspath(os.path.normpath(p)) for p in job.sources if pathlib.Path(p).exists()]
                 if valid_paths:
-                    watcher = SmartFolderWatcherThread(valid_paths, debounce_seconds=job.debounce_seconds)
-                    watcher.change_detected.connect(lambda msg, j=job: self.on_smart_change(j, msg))
+                    callback_slot = self._create_change_callback(job)
+                    watcher = SmartFolderWatcherManager(valid_paths, callback=callback_slot, debounce_seconds=job.debounce_seconds)
                     watcher.start()
                     self.smart_watchers.append(watcher)
                     self.log_output.append(f"👁️ OS Kernel Watcher Active: '{job.name}'")
 
     def on_smart_change(self, job: SyncJob, msg: str):
-        self.log_output.append(f"🔔 File Change Event for '{job.name}'")
+        self.log_output.append(f"🔔 {msg} for '{job.name}' -> Executing task...")
         self.execute_job_instance(job, dry_run=False)
 
     def on_drive_plugged_in(self, mountpoint: str):
-        self.log_output.append(f"🔌 USB Attached: {mountpoint}")
+        self.log_output.append(f"🔌 Drive Plugged In: {mountpoint}")
         for job in self.jobs:
             if job.schedule_type == ScheduleType.ON_DRIVE_CONNECT and job.is_active:
                 if any(mountpoint in t for t in job.targets):
                     self.execute_job_instance(job, dry_run=False)
 
-    def run_job(self):
-        idx = self.job_list.currentRow()
-        if idx >= 0:
-            self.execute_job_instance(self.jobs[idx], dry_run=self.dry_run_cb.isChecked())
+    def run_job(self, force_dry_run: bool = False):
+        job = self.get_selected_job()
+        if job:
+            is_dry = force_dry_run or self.dry_run_cb.isChecked()
+            self.execute_job_instance(job, dry_run=is_dry)
 
     def execute_job_instance(self, job: SyncJob, dry_run: bool):
-        self.run_btn.setEnabled(False)
+        self.btn_analyze.setEnabled(False)
+        self.btn_sync.setEnabled(False)
         self.progress_bar.setValue(0)
-        mode_str = "SIMULATION" if dry_run else "LIVE SYNC"
-        self.c2_val.setText("Executing...")
-        self.c2_val.setStyleSheet("font-size: 18px; font-weight: bold; color: #E17055;")
-        self.log_output.append(f"\n--- Starting {job.name} [{mode_str}] ---")
+        self.diff_tree.clear()
+
+        mode_str = "ANALYZE PREVIEW" if dry_run else "LIVE SYNC"
+        self.log_output.append(f"\n--- Running '{job.name}' [{mode_str}] ---")
 
         self.worker = SyncWorker(self.engine, job, dry_run)
         self.worker.progress_update.connect(lambda pct, msg: (self.progress_bar.setValue(pct), self.log_output.append(msg)))
+        self.worker.action_item_signal.connect(self.add_diff_tree_item)
         self.worker.error_signal.connect(lambda err: QMessageBox.critical(self, "Error", err))
         self.worker.finished_signal.connect(self.on_sync_finished)
         self.worker.start()
 
+    def add_diff_tree_item(self, item_data: dict):
+        direction = "➡️" if item_data["action_type"] == "COPY_TO_TARGET" else ("⬅️" if item_data["action_type"] == "COPY_TO_SOURCE" else "❌")
+        tree_item = QTreeWidgetItem(self.diff_tree, [
+            os.path.basename(item_data["source"] if item_data["source"] != "-" else item_data["target"]),
+            item_data["source"],
+            direction,
+            item_data["target"],
+            item_data["reason"]
+        ])
+        if item_data["action_type"] == "DELETE_TARGET":
+            tree_item.setForeground(4, QColor("#E74C3C"))
+
     def on_sync_finished(self, actions):
-        self.run_btn.setEnabled(True)
+        self.btn_analyze.setEnabled(True)
+        self.btn_sync.setEnabled(True)
         self.progress_bar.setValue(100)
-        self.c2_val.setText("Idle / Ready")
-        self.c2_val.setStyleSheet("font-size: 18px; font-weight: bold; color: #00B894;")
-        self.log_output.append(f"✅ Sync Finished. Actions: {len(actions)}\n")
+        self.log_output.append(f"✅ Sync Finished. Operations: {len(actions)}\n")
 
     def closeEvent(self, event):
         self.watcher.stop()
