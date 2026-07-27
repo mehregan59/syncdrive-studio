@@ -1,4 +1,36 @@
 import sys
+import subprocess
+import importlib.util
+
+# List of required packages mapped to their import names
+REQUIRED_PACKAGES = {
+    "PyQt6": "PyQt6",
+    "pydantic": "pydantic",
+    "psutil": "psutil"
+}
+
+def auto_install_dependencies():
+    """Checks for required packages and auto-installs missing ones via pip."""
+    missing = []
+    for pkg_name, import_name in REQUIRED_PACKAGES.items():
+        if importlib.util.find_spec(import_name) is None:
+            missing.append(pkg_name)
+
+    if missing:
+        print(f"Missing dependencies detected: {missing}. Installing automatically...")
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", *missing
+            ])
+            print("Dependencies installed successfully!")
+        except Exception as e:
+            print(f"Failed to auto-install dependencies: {e}")
+            sys.exit(1)
+
+# Run the auto-installer BEFORE attempting imports of 3rd party libraries
+auto_install_dependencies()
+
+# --- Normal Application Imports ---
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QLabel, QTextEdit, QCheckBox, QComboBox,
@@ -54,7 +86,7 @@ class JobDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addRow(self.buttons)
 
-    def get_job((self) -> SyncJob:
+    def get_job(self) -> SyncJob:
         sources = [s.strip() for s in self.sources_input.text().split(",") if s.strip()]
         targets = [t.strip() for t in self.targets_input.text().split(",") if t.strip()]
         
