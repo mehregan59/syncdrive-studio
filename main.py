@@ -23,7 +23,7 @@ def auto_install_dependencies():
 
     if missing:
         print("\n==================================================")
-        print(" [SyncDrive Studio] Installing Smart Event Monitor")
+        print(" [SyncDrive Studio] First-Time Setup & Module Check")
         print(f" Packages: {', '.join(missing)}")
         print("==================================================\n")
 
@@ -59,64 +59,68 @@ from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
 from engine import SyncEngine
 from drive_detector import DriveWatcherThread
 
-# --- Watchdog Imports & Smart Event Watcher ---
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+# Safe Watchdog Import
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    WATCHDOG_AVAILABLE = False
 
 
-class SmartChangeHandler(FileSystemEventHandler):
-    """Listens for OS file change events and debounces them to protect drives."""
-    def __init__(self, callback: Callable[[], None], debounce_seconds: int = 5):
-        super().__init__()
-        self.callback = callback
-        self.debounce_seconds = debounce_seconds
-        self.last_event_time = 0
+if WATCHDOG_AVAILABLE:
+    class SmartChangeHandler(FileSystemEventHandler):
+        """Listens for OS file change events and debounces them to protect drives."""
+        def __init__(self, callback: Callable[[], None], debounce_seconds: int = 5):
+            super().__init__()
+            self.callback = callback
+            self.debounce_seconds = debounce_seconds
+            self.last_event_time = 0
 
-    def on_any_event(self, event):
-        if event.is_directory:
-            return
-        
-        current_time = time.time()
-        if current_time - self.last_event_time > self.debounce_seconds:
-            self.last_event_time = current_time
-            self.callback()
+        def on_any_event(self, event):
+            if event.is_directory:
+                return
+            
+            current_time = time.time()
+            if current_time - self.last_event_time > self.debounce_seconds:
+                self.last_event_time = current_time
+                self.callback()
 
+    class SmartFolderWatcherThread(QThread):
+        change_detected = pyqtSignal(str)
 
-class SmartFolderWatcherThread(QThread):
-    change_detected = pyqtSignal(str)
+        def __init__(self, watch_paths: List[str], debounce_seconds: int = 5):
+            super().__init__()
+            self.watch_paths = watch_paths
+            self.debounce_seconds = debounce_seconds
+            self.observer = Observer()
 
-    def __init__(self, watch_paths: List[str], debounce_seconds: int = 5):
-        super().__init__()
-        self.watch_paths = watch_paths
-        self.debounce_seconds = debounce_seconds
-        self.observer = Observer()
+        def run(self):
+            handler = SmartChangeHandler(
+                callback=self._on_change_triggered,
+                debounce_seconds=self.debounce_seconds
+            )
 
-    def run(self):
-        handler = SmartChangeHandler(
-            callback=self._on_change_triggered,
-            debounce_seconds=self.debounce_seconds
-        )
+            for path_str in self.watch_paths:
+                try:
+                    self.observer.schedule(handler, path=path_str, recursive=True)
+                except Exception as e:
+                    print(f"Unable to watch path {path_str}: {e}")
 
-        for path_str in self.watch_paths:
+            self.observer.start()
             try:
-                self.observer.schedule(handler, path=path_str, recursive=True)
-            except Exception as e:
-                print(f"Unable to watch path {path_str}: {e}")
+                while self.observer.is_alive():
+                    time.sleep(1)
+            finally:
+                self.observer.stop()
+                self.observer.join()
 
-        self.observer.start()
-        try:
-            while self.observer.is_alive():
-                time.sleep(1)
-        finally:
+        def _on_change_triggered(self):
+            self.change_detected.emit("Smart file change event detected (debounced)")
+
+        def stop(self):
             self.observer.stop()
-            self.observer.join()
-
-    def _on_change_triggered(self):
-        self.change_detected.emit("Smart file change event detected (debounced)")
-
-    def stop(self):
-        self.observer.stop()
-        self.wait()
+            self.wait()
 
 
 # --- UI Stylesheet ---
@@ -166,39 +170,114 @@ def create_windows_shortcut(target_exe: pathlib.Path, shortcut_path: pathlib.Pat
 
 
 class SetupWizardDialog(QDialog):
+    """Setup Wizard with Disclaimer, Mode Selector, Custom Installation Location, and Progress Bar."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SyncDrive Studio - Setup Wizard")
-        self.setFixedSize(520, 320)
+        self.setWindowTitle("SyncDrive Studio - Setup & Installation Wizard")
+        self.setFixedSize(580, 520)
         self.setStyleSheet(DARK_STYLESHEET)
+        
         self.selected_mode = AppMode.PORTABLE
+        self.custom_install_path = str(pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio")
 
         layout = QVBoxLayout(self)
         
-        title = QLabel("Welcome to SyncDrive Studio")
+        title = QLabel("Welcome to SyncDrive Studio Setup")
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #00ADB5;")
         layout.addWidget(title)
-        
-        subtitle = QLabel("Select deployment mode for this machine:")
-        layout.addWidget(subtitle)
 
-        mode_group = QGroupBox("Deployment Mode")
+        # 1. Disclaimer Section
+        disc_group = QGroupBox("⚠️ License & Legal Disclaimer")
+        disc_box = QVBoxLayout(disc_group)
+        disc_text = QTextEdit()
+        disc_text.setReadOnly(True)
+        disc_text.setText(
+            "DISCLAIMER OF LIABILITY:\n\n"
+            "SyncDrive Studio is free, open-source software created solely for personal and utility use. "
+            "This software is provided 'AS-IS', WITHOUT WARRANTY OF ANY KIND, express or implied, including "
+            "but not limited to the warranties of merchantability, fitness for a particular purpose, or non-infringement.\n\n"
+            "In no event shall the author or copyright holders be liable for any claim, damages, data loss, "
+            "drive corruption, or other liability arising from, out of, or in connection with the software "
+            "or the use or other dealings in the software.\n\n"
+            "By checking the box below and continuing, you acknowledge that you are using this tool at your own risk."
+        )
+        disc_text.setMaximumHeight(120)
+        disc_box.addWidget(disc_text)
+
+        self.accept_cb = QCheckBox("I understand and accept the disclaimer terms")
+        self.accept_cb.stateChanged.connect(self.toggle_next_button)
+        disc_box.addWidget(self.accept_cb)
+        layout.addWidget(disc_group)
+
+        # 2. Deployment Mode Selection
+        mode_group = QGroupBox("Select Deployment Strategy")
         mode_box = QVBoxLayout(mode_group)
 
-        self.radio_portable = QRadioButton("📁 Portable Mode (Runs from current folder/USB drive)")
+        self.radio_portable = QRadioButton("📁 Portable Mode (No system changes, runs from current folder/USB)")
         self.radio_portable.setChecked(True)
-        self.radio_install = QRadioButton("💻 System Install Mode (Copies to Program Files + Desktop/Start Shortcuts)")
+        self.radio_portable.toggled.connect(self.toggle_location_box)
+
+        self.radio_install = QRadioButton("💻 System Install Mode (Copies to system, adds shortcuts)")
 
         mode_box.addWidget(self.radio_portable)
         mode_box.addWidget(self.radio_install)
         layout.addWidget(mode_group)
 
-        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-        self.buttons.accepted.connect(self.on_confirm)
-        layout.addWidget(self.buttons)
+        # 3. Custom Install Directory Selector
+        self.dir_group = QGroupBox("Installation Target Folder")
+        dir_box = QHBoxLayout(self.dir_group)
+        self.path_input = QLineEdit(self.custom_install_path)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self.browse_install_dir)
+        dir_box.addWidget(self.path_input)
+        dir_box.addWidget(browse_btn)
+        self.dir_group.setEnabled(False)
+        layout.addWidget(self.dir_group)
 
-    def on_confirm(self):
+        # 4. Installation Progress
+        self.prog_group = QGroupBox("Setup Progress")
+        prog_box = QVBoxLayout(self.prog_group)
+        self.install_progress = QProgressBar()
+        self.install_progress.setValue(0)
+        self.status_lbl = QLabel("Status: Waiting for user confirmation...")
+        prog_box.addWidget(self.install_progress)
+        prog_box.addWidget(self.status_lbl)
+        layout.addWidget(self.prog_group)
+
+        # Confirm Button
+        self.confirm_btn = QPushButton("Install & Launch")
+        self.confirm_btn.setEnabled(False)
+        self.confirm_btn.clicked.connect(self.start_installation)
+        layout.addWidget(self.confirm_btn)
+
+    def toggle_next_button(self):
+        self.confirm_btn.setEnabled(self.accept_cb.isChecked())
+
+    def toggle_location_box(self):
+        self.dir_group.setEnabled(self.radio_install.isChecked())
+
+    def browse_install_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Target Installation Folder")
+        if folder:
+            self.custom_install_path = str(pathlib.Path(folder) / "SyncDrive Studio")
+            self.path_input.setText(self.custom_install_path)
+
+    def start_installation(self):
         self.selected_mode = AppMode.INSTALLED if self.radio_install.isChecked() else AppMode.PORTABLE
+        self.custom_install_path = self.path_input.text().strip()
+        self.confirm_btn.setEnabled(False)
+
+        # Simulate visual installation progress
+        for i in range(1, 101):
+            time.sleep(0.015)
+            self.install_progress.setValue(i)
+            if i == 20: self.status_lbl.setText("Status: Provisioning environment...")
+            elif i == 50: self.status_lbl.setText("Status: Writing binary files...")
+            elif i == 80: self.status_lbl.setText("Status: Setting up shortcuts & configuration...")
+            QApplication.processEvents()
+
+        self.status_lbl.setText("Status: Installation Complete!")
+        time.sleep(0.3)
         self.accept()
 
 
@@ -514,7 +593,7 @@ class MainWindow(QMainWindow):
                 timer.start(interval_ms)
                 self.log_output.append(f"⏱️ Scheduled timer: '{job.name}' every {job.interval_minutes} mins")
 
-            elif job.schedule_type == ScheduleType.ON_FILE_CHANGE:
+            elif job.schedule_type == ScheduleType.ON_FILE_CHANGE and WATCHDOG_AVAILABLE:
                 valid_paths = [p for p in job.sources if pathlib.Path(p).exists()]
                 if valid_paths:
                     watcher = SmartFolderWatcherThread(valid_paths, debounce_seconds=job.debounce_seconds)
@@ -576,17 +655,18 @@ if __name__ == "__main__":
         exe_dir = exe_path.parent
 
     mode_file = exe_dir / ".app_mode"
-    
-    program_files_dir = pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio"
-    user_appdata_dir = pathlib.Path.home() / "AppData/Local/Programs/SyncDrive Studio"
 
     selected_mode = None
+    target_install_dir = None
+
     if mode_file.exists():
         selected_mode = AppMode.PORTABLE if mode_file.read_text().strip() == AppMode.PORTABLE.value else AppMode.INSTALLED
     else:
         wizard = SetupWizardDialog()
         if wizard.exec() == QDialog.DialogCode.Accepted:
             selected_mode = wizard.selected_mode
+            if selected_mode == AppMode.INSTALLED:
+                target_install_dir = pathlib.Path(wizard.custom_install_path)
             try:
                 mode_file.write_text(selected_mode.value)
             except Exception:
@@ -597,14 +677,14 @@ if __name__ == "__main__":
     config_dir = exe_dir / ".config" if selected_mode == AppMode.PORTABLE else pathlib.Path.home() / ".syncdrive_studio"
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    target_install_dir = None
-
     if selected_mode == AppMode.INSTALLED and getattr(sys, 'frozen', False):
+        if not target_install_dir:
+            target_install_dir = pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio"
+
         try:
-            target_install_dir = program_files_dir
             target_install_dir.mkdir(parents=True, exist_ok=True)
         except PermissionError:
-            target_install_dir = user_appdata_dir
+            target_install_dir = pathlib.Path.home() / "AppData/Local/Programs/SyncDrive Studio"
             target_install_dir.mkdir(parents=True, exist_ok=True)
 
         installed_exe = target_install_dir / "SyncDriveStudio.exe"
