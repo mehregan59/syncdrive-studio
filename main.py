@@ -6,6 +6,7 @@ import subprocess
 import importlib.util
 import multiprocessing
 import pathlib
+import ctypes
 from enum import Enum
 from typing import List, Callable
 
@@ -379,7 +380,7 @@ class ModernJobDialog(QDialog):
         layout.addLayout(drive_section)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.accepted.connect(self.accept)
+        self.buttons.accepted.connect(self.validate_and_accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
@@ -392,30 +393,44 @@ class ModernJobDialog(QDialog):
     def browse_source(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
         if folder:
-            current = [s.strip() for s in self.src_input.text().split(",") if s.strip()]
+            current = [s.strip().strip('"').strip("'") for s in self.src_input.text().split(",") if s.strip()]
             current.append(folder)
             self.src_input.setText(", ".join(current))
 
     def browse_target(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Target Folder / Drive")
         if folder:
-            current = [t.strip() for t in self.dst_input.text().split(",") if t.strip()]
+            current = [t.strip().strip('"').strip("'") for t in self.dst_input.text().split(",") if t.strip()]
             current.append(folder)
             self.dst_input.setText(", ".join(current))
 
-    def get_job(self) -> SyncJob:
-        sources = [s.strip() for s in self.src_input.text().split(",") if s.strip()]
-        targets = [t.strip() for t in self.dst_input.text().split(",") if t.strip()]
+    def validate_and_accept(self):
+        sources = [s.strip().strip('"').strip("'") for s in self.src_input.text().split(",") if s.strip()]
+        targets = [t.strip().strip('"').strip("'") for t in self.dst_input.text().split(",") if t.strip()]
 
-        return SyncJob(
-            id=self.job.id if self.job else None,
-            name=self.name_input.text().strip(),
-            sources=sources,
-            targets=targets,
-            mode=SyncMode(self.mode_combo.currentText()),
-            schedule_type=ScheduleType(self.schedule_combo.currentText()),
-            interval_minutes=self.interval_spin.value()
-        )
+        if not sources or not targets:
+            QMessageBox.warning(self, "Validation Error", "Please provide at least one valid Source and Target folder.")
+            return
+
+        self.accept()
+
+    def get_job(self) -> SyncJob:
+        sources = [s.strip().strip('"').strip("'") for s in self.src_input.text().split(",") if s.strip()]
+        targets = [t.strip().strip('"').strip("'") for t in self.dst_input.text().split(",") if t.strip()]
+
+        try:
+            return SyncJob(
+                id=self.job.id if self.job else None,
+                name=self.name_input.text().strip() or "Untitled Job",
+                sources=sources,
+                targets=targets,
+                mode=SyncMode(self.mode_combo.currentText()),
+                schedule_type=ScheduleType(self.schedule_combo.currentText()),
+                interval_minutes=self.interval_spin.value()
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Configuration Error", f"Unable to save job:\n{e}")
+            return self.job
 
 
 class MainWindow(QMainWindow):
@@ -530,18 +545,22 @@ class MainWindow(QMainWindow):
     def add_job(self):
         dialog = ModernJobDialog(self)
         if dialog.exec():
-            self.jobs.append(dialog.get_job())
-            self.refresh_job_list()
-            self.init_timers_and_smart_watchers()
+            new_job = dialog.get_job()
+            if new_job:
+                self.jobs.append(new_job)
+                self.refresh_job_list()
+                self.init_timers_and_smart_watchers()
 
     def edit_job(self):
         idx = self.job_list.currentRow()
         if idx >= 0:
             dialog = ModernJobDialog(self, job=self.jobs[idx])
             if dialog.exec():
-                self.jobs[idx] = dialog.get_job()
-                self.refresh_job_list()
-                self.init_timers_and_smart_watchers()
+                updated_job = dialog.get_job()
+                if updated_job:
+                    self.jobs[idx] = updated_job
+                    self.refresh_job_list()
+                    self.init_timers_and_smart_watchers()
 
     def delete_job(self):
         idx = self.job_list.currentRow()
@@ -657,28 +676,23 @@ if __name__ == "__main__":
 
     mode_file = exe_dir / ".app_mode"
 
-    # Default Program Files Target
-    default_install_dir = pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio"
-    user_appdata_dir = pathlib.Path.home() / "AppData/Local/Programs/SyncDrive Studio"
-
-    # Determine if running as a fresh installer or from installed location
-    is_installed_location = (exe_dir == default_install_dir) or (exe_dir == user_appdata_dir)
-
     selected_mode = None
     target_install_dir = None
 
-    # If running from installed directory and .app_mode exists, launch directly.
-    # Otherwise, open Setup Wizard every time installer is double-clicked elsewhere.
-    if is_installed_location and mode_file.exists():
+    is_installed_instance = mode_file.exists() and (exe_dir.name == "SyncDrive Studio")
+
+    if is_installed_instance:
         selected_mode = AppMode.PORTABLE if mode_file.read_text().strip() == AppMode.PORTABLE.value else AppMode.INSTALLED
+        target_install_dir = exe_dir
     else:
         wizard = SetupWizardDialog()
         if wizard.exec() == QDialog.DialogCode.Accepted:
             selected_mode = wizard.selected_mode
             if selected_mode == AppMode.INSTALLED:
                 target_install_dir = pathlib.Path(wizard.custom_install_path)
+            else:
+                target_install_dir = exe_dir
             try:
-                # Force update/rewrite mode setting
                 mode_file.write_text(selected_mode.value)
             except Exception:
                 pass
@@ -688,32 +702,32 @@ if __name__ == "__main__":
     config_dir = exe_dir / ".config" if selected_mode == AppMode.PORTABLE else pathlib.Path.home() / ".syncdrive_studio"
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    if selected_mode == AppMode.INSTALLED and getattr(sys, 'frozen', False):
-        if not target_install_dir:
-            target_install_dir = default_install_dir
-
+    if selected_mode == AppMode.INSTALLED and getattr(sys, 'frozen', False) and target_install_dir:
         try:
             target_install_dir.mkdir(parents=True, exist_ok=True)
+            installed_exe = target_install_dir / "SyncDriveStudio.exe"
+
+            if exe_path.resolve() != installed_exe.resolve():
+                shutil.copy2(exe_path, installed_exe)
+                try:
+                    (target_install_dir / ".app_mode").write_text(AppMode.INSTALLED.value)
+                except Exception:
+                    pass
+
+            desktop_shortcut = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
+            start_menu_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
+            icon_file = exe_dir / "app_icon.ico"
+
+            create_windows_shortcut(installed_exe, desktop_shortcut, icon_file)
+            create_windows_shortcut(installed_exe, start_menu_shortcut, icon_file)
         except PermissionError:
-            target_install_dir = user_appdata_dir
-            target_install_dir.mkdir(parents=True, exist_ok=True)
-
-        installed_exe = target_install_dir / "SyncDriveStudio.exe"
-        
-        # Self-copy binary to target location and write local .app_mode flag
-        if exe_path != installed_exe:
-            shutil.copy2(exe_path, installed_exe)
-            try:
-                (target_install_dir / ".app_mode").write_text(AppMode.INSTALLED.value)
-            except Exception:
-                pass
-
-        desktop_shortcut = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
-        start_menu_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
-        icon_file = exe_dir / "app_icon.ico"
-
-        create_windows_shortcut(installed_exe, desktop_shortcut, icon_file)
-        create_windows_shortcut(installed_exe, start_menu_shortcut, icon_file)
+            if sys.platform.startswith("win"):
+                QMessageBox.warning(
+                    None,
+                    "Administrator Required",
+                    f"Writing to '{target_install_dir}' requires Administrator rights.\nPlease right-click the setup file and select 'Run as Administrator'."
+                )
+                sys.exit(1)
 
     window = MainWindow(app_mode=selected_mode, config_dir=config_dir, install_dir=target_install_dir)
     window.show()
