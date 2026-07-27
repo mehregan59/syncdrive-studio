@@ -123,7 +123,6 @@ if WATCHDOG_AVAILABLE:
             self.wait()
 
 
-# --- UI Stylesheet ---
 DARK_STYLESHEET = """
 QMainWindow { background-color: #121212; }
 QWidget { color: #E0E0E0; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
@@ -267,7 +266,7 @@ class SetupWizardDialog(QDialog):
         self.custom_install_path = self.path_input.text().strip()
         self.confirm_btn.setEnabled(False)
 
-        # Simulate visual installation progress
+        # Simulate visual installation progress bar
         for i in range(1, 101):
             time.sleep(0.015)
             self.install_progress.setValue(i)
