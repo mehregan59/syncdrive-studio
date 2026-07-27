@@ -657,10 +657,19 @@ if __name__ == "__main__":
 
     mode_file = exe_dir / ".app_mode"
 
+    # Default Program Files Target
+    default_install_dir = pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio"
+    user_appdata_dir = pathlib.Path.home() / "AppData/Local/Programs/SyncDrive Studio"
+
+    # Determine if running as a fresh installer or from installed location
+    is_installed_location = (exe_dir == default_install_dir) or (exe_dir == user_appdata_dir)
+
     selected_mode = None
     target_install_dir = None
 
-    if mode_file.exists():
+    # If running from installed directory and .app_mode exists, launch directly.
+    # Otherwise, open Setup Wizard every time installer is double-clicked elsewhere.
+    if is_installed_location and mode_file.exists():
         selected_mode = AppMode.PORTABLE if mode_file.read_text().strip() == AppMode.PORTABLE.value else AppMode.INSTALLED
     else:
         wizard = SetupWizardDialog()
@@ -669,6 +678,7 @@ if __name__ == "__main__":
             if selected_mode == AppMode.INSTALLED:
                 target_install_dir = pathlib.Path(wizard.custom_install_path)
             try:
+                # Force update/rewrite mode setting
                 mode_file.write_text(selected_mode.value)
             except Exception:
                 pass
@@ -680,17 +690,23 @@ if __name__ == "__main__":
 
     if selected_mode == AppMode.INSTALLED and getattr(sys, 'frozen', False):
         if not target_install_dir:
-            target_install_dir = pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio"
+            target_install_dir = default_install_dir
 
         try:
             target_install_dir.mkdir(parents=True, exist_ok=True)
         except PermissionError:
-            target_install_dir = pathlib.Path.home() / "AppData/Local/Programs/SyncDrive Studio"
+            target_install_dir = user_appdata_dir
             target_install_dir.mkdir(parents=True, exist_ok=True)
 
         installed_exe = target_install_dir / "SyncDriveStudio.exe"
-        if exe_path != installed_exe and not installed_exe.exists():
+        
+        # Self-copy binary to target location and write local .app_mode flag
+        if exe_path != installed_exe:
             shutil.copy2(exe_path, installed_exe)
+            try:
+                (target_install_dir / ".app_mode").write_text(AppMode.INSTALLED.value)
+            except Exception:
+                pass
 
         desktop_shortcut = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
         start_menu_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
