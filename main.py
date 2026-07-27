@@ -1,11 +1,13 @@
 import sys
 import os
+import time
 import shutil
 import subprocess
 import importlib.util
 import multiprocessing
 import pathlib
 from enum import Enum
+from typing import List, Callable
 
 # List of required packages
 REQUIRED_PACKAGES = {
@@ -56,9 +58,68 @@ from PyQt6.QtGui import QIcon
 from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
 from engine import SyncEngine
 from drive_detector import DriveWatcherThread
-from smart_watcher import SmartFolderWatcherThread
+
+# --- Watchdog Imports & Smart Event Watcher ---
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 
+class SmartChangeHandler(FileSystemEventHandler):
+    """Listens for OS file change events and debounces them to protect drives."""
+    def __init__(self, callback: Callable[[], None], debounce_seconds: int = 5):
+        super().__init__()
+        self.callback = callback
+        self.debounce_seconds = debounce_seconds
+        self.last_event_time = 0
+
+    def on_any_event(self, event):
+        if event.is_directory:
+            return
+        
+        current_time = time.time()
+        if current_time - self.last_event_time > self.debounce_seconds:
+            self.last_event_time = current_time
+            self.callback()
+
+
+class SmartFolderWatcherThread(QThread):
+    change_detected = pyqtSignal(str)
+
+    def __init__(self, watch_paths: List[str], debounce_seconds: int = 5):
+        super().__init__()
+        self.watch_paths = watch_paths
+        self.debounce_seconds = debounce_seconds
+        self.observer = Observer()
+
+    def run(self):
+        handler = SmartChangeHandler(
+            callback=self._on_change_triggered,
+            debounce_seconds=self.debounce_seconds
+        )
+
+        for path_str in self.watch_paths:
+            try:
+                self.observer.schedule(handler, path=path_str, recursive=True)
+            except Exception as e:
+                print(f"Unable to watch path {path_str}: {e}")
+
+        self.observer.start()
+        try:
+            while self.observer.is_alive():
+                time.sleep(1)
+        finally:
+            self.observer.stop()
+            self.observer.join()
+
+    def _on_change_triggered(self):
+        self.change_detected.emit("Smart file change event detected (debounced)")
+
+    def stop(self):
+        self.observer.stop()
+        self.wait()
+
+
+# --- UI Stylesheet ---
 DARK_STYLESHEET = """
 QMainWindow { background-color: #121212; }
 QWidget { color: #E0E0E0; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
@@ -210,7 +271,6 @@ class ModernJobDialog(QDialog):
         self.schedule_combo.currentTextChanged.connect(self.toggle_trigger_options)
         top_layout.addRow("Trigger Strategy:", self.schedule_combo)
 
-        # Interval Spinner Controls
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 1440)
         self.interval_spin.setValue(job.interval_minutes if job else 30)
@@ -219,7 +279,6 @@ class ModernJobDialog(QDialog):
 
         layout.addWidget(top_group)
 
-        # Folder Selectors
         drive_section = QHBoxLayout()
 
         src_group = QGroupBox("2. Source Folders")
@@ -292,7 +351,6 @@ class MainWindow(QMainWindow):
         self.resize(1000, 680)
         self.setStyleSheet(DARK_STYLESHEET)
 
-        # Set Window Icon
         icon_path = (self.install_dir or config_dir) / "app_icon.ico"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -340,7 +398,6 @@ class MainWindow(QMainWindow):
         btn_box.addWidget(del_btn)
         left_box.addLayout(btn_box)
 
-        # Uninstall / Cleanup Data Button
         uninstall_btn = QPushButton("🗑️ Uninstall SyncDrive Studio")
         uninstall_btn.setStyleSheet("background-color: #D9534F; color: white; margin-top: 10px;")
         uninstall_btn.clicked.connect(self.run_uninstall)
@@ -424,14 +481,12 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            # Delete Desktop & Start Menu Shortcuts
             desktop_link = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
             start_link = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
             
             desktop_link.unlink(missing_ok=True)
             start_link.unlink(missing_ok=True)
 
-            # Clean Config Directory
             if self.config_dir.exists():
                 shutil.rmtree(self.config_dir, ignore_errors=True)
 
@@ -522,7 +577,6 @@ if __name__ == "__main__":
 
     mode_file = exe_dir / ".app_mode"
     
-    # Target Install Path in Program Files (or LocalAppData fallback if non-admin)
     program_files_dir = pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio"
     user_appdata_dir = pathlib.Path.home() / "AppData/Local/Programs/SyncDrive Studio"
 
@@ -545,7 +599,6 @@ if __name__ == "__main__":
 
     target_install_dir = None
 
-    # Handle Program Files setup & Shortcut generation for Install Mode
     if selected_mode == AppMode.INSTALLED and getattr(sys, 'frozen', False):
         try:
             target_install_dir = program_files_dir
@@ -558,7 +611,6 @@ if __name__ == "__main__":
         if exe_path != installed_exe and not installed_exe.exists():
             shutil.copy2(exe_path, installed_exe)
 
-        # Generate Shortcuts with Icons
         desktop_shortcut = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
         start_menu_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
         icon_file = exe_dir / "app_icon.ico"
