@@ -750,6 +750,8 @@ class SyncWorker(QThread):
                             shutil.copy2(action.target_path, s)
                         elif action.action_type == "DELETE_TARGET":
                             pathlib.Path(action.target_path).unlink(missing_ok=True)
+                        elif action.action_type == "DELETE_SOURCE":
+                            pathlib.Path(action.source_path).unlink(missing_ok=True)
                     except Exception as file_err:
                         # One bad file (locked, permission denied, vanished mid-sync)
                         # must not kill the whole run or silently stop the app from
@@ -757,6 +759,12 @@ class SyncWorker(QThread):
                         self.progress_update.emit(pct, f"⚠️ Skipped {action.target_path or action.source_path}: {file_err}")
 
                 self.progress_update.emit(pct, msg)
+
+            if not self.dry_run:
+                # Snapshot which files now exist on both sides so the NEXT
+                # plan_job() call can tell a deleted file apart from a new one
+                # instead of treating both as "missing on one side, copy it back".
+                self.engine.record_post_sync_state(self.job)
         except Exception as e:
             self.error_signal.emit(str(e))
         finally:
