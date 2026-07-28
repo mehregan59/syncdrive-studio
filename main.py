@@ -715,6 +715,7 @@ class SyncWorker(QThread):
         self.stop_requested = True
 
     def run(self):
+        actions = []
         try:
             actions = self.engine.plan_job(self.job)
             total = len(actions)
@@ -738,22 +739,31 @@ class SyncWorker(QThread):
                 })
 
                 if not self.dry_run:
-                    if action.action_type == "COPY_TO_TARGET":
-                        d = pathlib.Path(action.target_path)
-                        d.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(action.source_path, d)
-                    elif action.action_type == "COPY_TO_SOURCE":
-                        s = pathlib.Path(action.source_path)
-                        s.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(action.target_path, s)
-                    elif action.action_type == "DELETE_TARGET":
-                        pathlib.Path(action.target_path).unlink(missing_ok=True)
+                    try:
+                        if action.action_type == "COPY_TO_TARGET":
+                            d = pathlib.Path(action.target_path)
+                            d.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(action.source_path, d)
+                        elif action.action_type == "COPY_TO_SOURCE":
+                            s = pathlib.Path(action.source_path)
+                            s.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(action.target_path, s)
+                        elif action.action_type == "DELETE_TARGET":
+                            pathlib.Path(action.target_path).unlink(missing_ok=True)
+                    except Exception as file_err:
+                        # One bad file (locked, permission denied, vanished mid-sync)
+                        # must not kill the whole run or silently stop the app from
+                        # ever reacting to file changes again — log it and keep going.
+                        self.progress_update.emit(pct, f"⚠️ Skipped {action.target_path or action.source_path}: {file_err}")
 
                 self.progress_update.emit(pct, msg)
-
-            self.finished_signal.emit(actions)
         except Exception as e:
             self.error_signal.emit(str(e))
+        finally:
+            # Always emit finished, even on a planning error — on_sync_finished
+            # is what re-enables buttons and runs any queued file-change trigger,
+            # so skipping it here would leave the app stuck after one failure.
+            self.finished_signal.emit(actions)
 
 
 class ModernJobDialog(QDialog):
@@ -785,6 +795,17 @@ class ModernJobDialog(QDialog):
 
         self.interval_picker = IntervalPicker(initial_minutes=job.interval_minutes if job else 30)
         top_layout.addRow("Repeat Interval:", self.interval_picker)
+
+        self.debounce_spin = QSpinBox()
+        self.debounce_spin.setRange(1, 60)
+        self.debounce_spin.setSuffix(" sec")
+        self.debounce_spin.setValue(job.debounce_seconds if job else 5)
+        self.debounce_spin.setToolTip(
+            "Only used for 'on_file_change'. After a file changes, the app waits this "
+            "long for things to settle before syncing, so a burst of edits triggers one "
+            "sync instead of many. Lower = reacts faster; higher = fewer, batched syncs."
+        )
+        top_layout.addRow("React After (file-change only):", self.debounce_spin)
 
         layout.addWidget(top_group)
 
@@ -870,7 +891,8 @@ class ModernJobDialog(QDialog):
                 targets=targets,
                 mode=SyncMode(self.mode_combo.currentText()),
                 schedule_type=ScheduleType(self.schedule_combo.currentText()),
-                interval_minutes=self.interval_picker.value()
+                interval_minutes=self.interval_picker.value(),
+                debounce_seconds=self.debounce_spin.value()
             )
         except Exception as e:
             QMessageBox.critical(self, "Configuration Error", f"Unable to save job:\n{e}")
