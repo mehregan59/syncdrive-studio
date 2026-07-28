@@ -7,6 +7,7 @@ import subprocess
 import importlib.util
 import multiprocessing
 import pathlib
+from datetime import datetime
 from enum import Enum
 from typing import List, Callable
 
@@ -174,44 +175,50 @@ if WATCHDOG_AVAILABLE:
 
 GOODSYNC_STUDIO_STYLESHEET = """
 QMainWindow {
-    background-color: #12131C;
+    background-color: #0F1017;
 }
 
 QWidget {
-    color: #E2E4F0;
+    color: #E6E8F5;
     font-family: 'Segoe UI', 'SF Pro Display', sans-serif;
     font-size: 12px;
 }
 
 /* Top Toolbar Ribbon */
 #ToolbarFrame {
-    background-color: #1E1F2E;
-    border-bottom: 1px solid #28293D;
-    padding: 6px 12px;
+    background-color: #181A26;
+    border-bottom: 1px solid #262838;
+    padding: 8px 14px;
 }
 
 QPushButton#RibbonBtn {
-    background-color: #28293D;
-    color: #FFFFFF;
-    border: 1px solid #3B3C54;
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-weight: bold;
+    background-color: #23253590;
+    color: #E6E8F5;
+    border: 1px solid #33354A;
+    border-radius: 8px;
+    padding: 7px 14px;
+    font-weight: 600;
     font-size: 12px;
 }
 
 QPushButton#RibbonBtn:hover {
     background-color: #6C5CE7;
-    border-color: #7D6EEB;
+    border-color: #8778F0;
+    color: #FFFFFF;
+}
+
+QPushButton#RibbonBtn:disabled {
+    color: #565875;
+    border-color: #262838;
 }
 
 QPushButton#RibbonBtnPrimary {
     background-color: #6C5CE7;
     color: #FFFFFF;
     border: none;
-    border-radius: 6px;
-    padding: 6px 14px;
-    font-weight: bold;
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-weight: 700;
     font-size: 12px;
 }
 
@@ -219,13 +226,34 @@ QPushButton#RibbonBtnPrimary:hover {
     background-color: #7D6EEB;
 }
 
+QPushButton#RibbonBtnPrimary:disabled {
+    background-color: #2C2D3D;
+    color: #5C5E78;
+}
+
+QPushButton#PresetBtn {
+    background-color: #1E2030;
+    color: #B8BAD6;
+    border: 1px solid #2E3046;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QPushButton#PresetBtn:checked, QPushButton#PresetBtn:hover {
+    background-color: #6C5CE7;
+    color: #FFFFFF;
+    border-color: #8778F0;
+}
+
 QPushButton#StopBtn {
     background-color: #E74C3C;
     color: #FFFFFF;
     border: none;
-    border-radius: 6px;
-    padding: 6px 14px;
-    font-weight: bold;
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-weight: 700;
     font-size: 12px;
 }
 
@@ -234,44 +262,75 @@ QPushButton#StopBtn:hover {
 }
 
 QPushButton#StopBtn:disabled {
-    background-color: #333344;
-    color: #666677;
+    background-color: #23253A;
+    color: #565875;
 }
 
 /* Compact Connection Header Bar */
 #ConnectionHeader {
-    background-color: #171824;
-    border-bottom: 1px solid #28293D;
-    padding: 6px 12px;
+    background-color: #14151F;
+    border-bottom: 1px solid #262838;
+    padding: 8px 14px;
 }
 
 #PathCard {
-    background-color: #1E1F2E;
-    border: 1px solid #2B2C42;
-    border-radius: 6px;
-    padding: 4px 10px;
+    background-color: #1A1C29;
+    border: 1px solid #2A2C40;
+    border-radius: 8px;
+    padding: 5px 12px;
+}
+
+/* Stat / Dashboard Cards */
+#StatCard {
+    background-color: #171826;
+    border: 1px solid #262838;
+    border-radius: 10px;
+    padding: 8px 14px;
+}
+
+#StatValueLbl {
+    font-size: 18px;
+    font-weight: 800;
+    color: #FFFFFF;
+}
+
+#StatCaptionLbl {
+    font-size: 10px;
+    color: #8A8CAD;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
 }
 
 /* Trees & Tables */
 QTreeWidget, QListWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox {
-    background-color: #171824;
-    border: 1px solid #2B2C42;
-    border-radius: 6px;
-    padding: 4px;
+    background-color: #14151F;
+    border: 1px solid #262838;
+    border-radius: 8px;
+    padding: 5px;
     color: #FFFFFF;
+    selection-background-color: #6C5CE7;
+}
+
+QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button {
+    border: none;
+    width: 18px;
 }
 
 QHeaderView::section {
-    background-color: #1E1F2E;
-    color: #8E8EA8;
-    padding: 6px;
+    background-color: #1A1C29;
+    color: #8A8CAD;
+    padding: 7px;
     border: none;
-    font-weight: bold;
+    font-weight: 700;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
 }
 
 QTreeWidget::item {
-    padding: 5px;
-    border-bottom: 1px solid #1E1F2E;
+    padding: 6px 4px;
+    border-bottom: 1px solid #1A1C29;
 }
 
 QTreeWidget::item:selected, QListWidget::item:selected {
@@ -279,11 +338,39 @@ QTreeWidget::item:selected, QListWidget::item:selected {
     color: #FFFFFF;
 }
 
+QGroupBox {
+    border: 1px solid #262838;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 12px;
+    font-weight: 700;
+    color: #B8BAD6;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+}
+
+QCheckBox::indicator {
+    width: 15px;
+    height: 15px;
+    border-radius: 4px;
+    border: 1px solid #3A3C56;
+    background-color: #14151F;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #00B894;
+    border-color: #00B894;
+}
+
 /* Progress Bar */
 QProgressBar {
     border: none;
-    border-radius: 6px;
-    background-color: #171824;
+    border-radius: 8px;
+    background-color: #14151F;
     text-align: center;
     color: white;
     font-weight: bold;
@@ -291,7 +378,7 @@ QProgressBar {
 
 QProgressBar::chunk {
     background-color: #00B894;
-    border-radius: 6px;
+    border-radius: 8px;
 }
 
 QToolTip {
@@ -430,6 +517,59 @@ class SetupWizardDialog(QDialog):
         self.accept()
 
 
+class IntervalPicker(QWidget):
+    """A friendlier way to set 'sync every N minutes' than a bare spinbox:
+    one-click common presets, plus a custom spinbox for anything else."""
+    valueChanged = pyqtSignal(int)
+
+    PRESETS = [("5m", 5), ("15m", 15), ("30m", 30), ("1h", 60), ("6h", 360), ("24h", 1440)]
+
+    def __init__(self, parent=None, initial_minutes: int = 30):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+
+        self._preset_buttons = []
+        for label, minutes in self.PRESETS:
+            btn = QPushButton(label)
+            btn.setObjectName("PresetBtn")
+            btn.setCheckable(True)
+            btn.setFixedHeight(24)
+            btn.clicked.connect(lambda _, m=minutes: self.set_minutes(m))
+            row.addWidget(btn)
+            self._preset_buttons.append((btn, minutes))
+
+        self.spin = QSpinBox()
+        self.spin.setRange(1, 1440)
+        self.spin.setSuffix(" min")
+        self.spin.setFixedHeight(24)
+        self.spin.valueChanged.connect(self._on_spin_changed)
+        row.addWidget(self.spin)
+
+        self.set_minutes(initial_minutes)
+
+    def _sync_preset_highlight(self, minutes: int):
+        for btn, m in self._preset_buttons:
+            btn.blockSignals(True)
+            btn.setChecked(m == minutes)
+            btn.blockSignals(False)
+
+    def _on_spin_changed(self, value: int):
+        self._sync_preset_highlight(value)
+        self.valueChanged.emit(value)
+
+    def set_minutes(self, minutes: int):
+        self.spin.blockSignals(True)
+        self.spin.setValue(minutes)
+        self.spin.blockSignals(False)
+        self._sync_preset_highlight(minutes)
+        self.valueChanged.emit(minutes)
+
+    def value(self) -> int:
+        return self.spin.value()
+
+
 class SyncWorker(QThread):
     progress_update = pyqtSignal(int, str)
     action_item_signal = pyqtSignal(dict)
@@ -515,11 +655,8 @@ class ModernJobDialog(QDialog):
         self.schedule_combo.currentTextChanged.connect(self.toggle_trigger_options)
         top_layout.addRow("Trigger Strategy:", self.schedule_combo)
 
-        self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(1, 1440)
-        self.interval_spin.setValue(job.interval_minutes if job else 30)
-        self.interval_spin.setSuffix(" Minutes")
-        top_layout.addRow("Repeat Interval:", self.interval_spin)
+        self.interval_picker = IntervalPicker(initial_minutes=job.interval_minutes if job else 30)
+        top_layout.addRow("Repeat Interval:", self.interval_picker)
 
         layout.addWidget(top_group)
 
@@ -555,7 +692,7 @@ class ModernJobDialog(QDialog):
         self.toggle_trigger_options(self.schedule_combo.currentText())
 
     def toggle_trigger_options(self, selected_mode: str):
-        self.interval_spin.setEnabled(selected_mode == ScheduleType.INTERVAL.value)
+        self.interval_picker.setEnabled(selected_mode == ScheduleType.INTERVAL.value)
 
     def browse_source(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
@@ -605,7 +742,7 @@ class ModernJobDialog(QDialog):
                 targets=targets,
                 mode=SyncMode(self.mode_combo.currentText()),
                 schedule_type=ScheduleType(self.schedule_combo.currentText()),
-                interval_minutes=self.interval_spin.value()
+                interval_minutes=self.interval_picker.value()
             )
         except Exception as e:
             QMessageBox.critical(self, "Configuration Error", f"Unable to save job:\n{e}")
@@ -671,6 +808,11 @@ class MainWindow(QMainWindow):
         btn_del.clicked.connect(self.delete_job)
         tb_layout.addWidget(btn_del)
 
+        self.btn_toggle_active = QPushButton("⏸ Pause Task")
+        self.btn_toggle_active.setObjectName("RibbonBtn")
+        self.btn_toggle_active.clicked.connect(self.toggle_selected_job_active)
+        tb_layout.addWidget(self.btn_toggle_active)
+
         tb_layout.addSpacing(15)
 
         self.btn_analyze = QPushButton("🔍 Analyze (Preview)")
@@ -699,11 +841,9 @@ class MainWindow(QMainWindow):
         self.quick_schedule_combo.currentTextChanged.connect(self.on_quick_schedule_changed)
         tb_layout.addWidget(self.quick_schedule_combo)
 
-        self.quick_interval_spin = QSpinBox()
-        self.quick_interval_spin.setRange(1, 1440)
-        self.quick_interval_spin.setSuffix("m")
-        self.quick_interval_spin.valueChanged.connect(self.on_quick_interval_changed)
-        tb_layout.addWidget(self.quick_interval_spin)
+        self.quick_interval_picker = IntervalPicker()
+        self.quick_interval_picker.valueChanged.connect(self.on_quick_interval_changed)
+        tb_layout.addWidget(self.quick_interval_picker)
 
         self.dry_run_cb = QCheckBox("Dry-Run")
         self.dry_run_cb.setToolTip("Scans drive differences without performing file changes.")
@@ -747,7 +887,43 @@ class MainWindow(QMainWindow):
         dst_c_layout.addWidget(self.dst_lbl)
         conn_layout.addWidget(dst_card, 1)
 
+        last_run_card = QFrame()
+        last_run_card.setObjectName("PathCard")
+        last_run_c_layout = QHBoxLayout(last_run_card)
+        last_run_c_layout.setContentsMargins(6, 2, 6, 2)
+        self.last_run_lbl = QLabel("🕓 Last synced: —")
+        self.last_run_lbl.setStyleSheet("font-weight: bold; color: #B8BAD6;")
+        last_run_c_layout.addWidget(self.last_run_lbl)
+        conn_layout.addWidget(last_run_card, 1)
+
         layout.addWidget(conn_frame)
+
+        # 2b. Dashboard stat cards — quick at-a-glance overview
+        stats_frame = QFrame()
+        stats_layout = QHBoxLayout(stats_frame)
+        stats_layout.setContentsMargins(14, 10, 14, 10)
+        stats_layout.setSpacing(10)
+
+        def make_stat_card(caption: str):
+            card = QFrame()
+            card.setObjectName("StatCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(4, 2, 4, 2)
+            card_layout.setSpacing(0)
+            value_lbl = QLabel("0")
+            value_lbl.setObjectName("StatValueLbl")
+            caption_lbl = QLabel(caption)
+            caption_lbl.setObjectName("StatCaptionLbl")
+            card_layout.addWidget(value_lbl)
+            card_layout.addWidget(caption_lbl)
+            stats_layout.addWidget(card, 1)
+            return value_lbl
+
+        self.stat_total_jobs_lbl = make_stat_card("Total Tasks")
+        self.stat_active_watchers_lbl = make_stat_card("Live Watchers")
+        self.stat_paused_lbl = make_stat_card("Paused Tasks")
+        stats_layout.addStretch()
+        layout.addWidget(stats_frame)
 
         # 3. Main Splitter View (No vast empty space)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -866,7 +1042,8 @@ class MainWindow(QMainWindow):
         twoway_node = QTreeWidgetItem(self.job_tree, ["🔄 Bidirectional Tasks"])
 
         for job in self.jobs:
-            text = f"⚡ {job.name}"
+            status_icon = "⚡" if job.is_active else "⏸"
+            text = f"{status_icon} {job.name}"
             if job.mode == SyncMode.ONE_WAY_BACKUP:
                 item = QTreeWidgetItem(backup_node, [text])
             elif job.mode == SyncMode.ONE_WAY_MIRROR:
@@ -874,8 +1051,20 @@ class MainWindow(QMainWindow):
             else:
                 item = QTreeWidgetItem(twoway_node, [text])
             item.setData(0, Qt.ItemDataRole.UserRole, job.id)
+            if not job.is_active:
+                item.setForeground(0, QColor("#5A5B72"))
+                item.setToolTip(0, "Paused — won't run on schedule or file changes")
 
         self.job_tree.expandAll()
+        self.update_stat_cards()
+
+    def update_stat_cards(self):
+        total = len(self.jobs)
+        paused = sum(1 for j in self.jobs if not j.is_active)
+        active_watchers = getattr(self, "active_watchers_count", 0)
+        self.stat_total_jobs_lbl.setText(str(total))
+        self.stat_active_watchers_lbl.setText(str(active_watchers))
+        self.stat_paused_lbl.setText(str(paused))
 
     def get_selected_job(self) -> SyncJob:
         item = self.job_tree.currentItem()
@@ -894,22 +1083,38 @@ class MainWindow(QMainWindow):
             self.src_lbl.setText(f"📁 Source: {src_str}")
             self.dst_lbl.setText(f"💾 Target: {dst_str}")
 
+            last_run_str = job.last_run_at if job.last_run_at else "never"
+            self.last_run_lbl.setText(f"🕓 Last synced: {last_run_str}")
+
+            self.btn_toggle_active.setText("▶ Resume Task" if not job.is_active else "⏸ Pause Task")
+
             # Sync quick toolbar widgets without infinite loop
             self.quick_schedule_combo.blockSignals(True)
-            self.quick_interval_spin.blockSignals(True)
             self.quick_schedule_combo.setCurrentText(job.schedule_type.value)
-            self.quick_interval_spin.setValue(job.interval_minutes)
-            self.quick_interval_spin.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
             self.quick_schedule_combo.blockSignals(False)
-            self.quick_interval_spin.blockSignals(False)
+            self.quick_interval_picker.blockSignals(True)
+            self.quick_interval_picker.set_minutes(job.interval_minutes)
+            self.quick_interval_picker.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
+            self.quick_interval_picker.blockSignals(False)
 
             self.log_output.append(f"ℹ️ Selected task: '{job.name}' [{job.mode.value}]")
+
+    def toggle_selected_job_active(self):
+        job = self.get_selected_job()
+        if job:
+            job.is_active = not job.is_active
+            self.btn_toggle_active.setText("▶ Resume Task" if not job.is_active else "⏸ Pause Task")
+            state = "resumed" if job.is_active else "paused"
+            self.log_output.append(f"{'▶️' if job.is_active else '⏸️'} Task '{job.name}' {state}.")
+            self.refresh_job_tree()
+            self.init_timers_and_smart_watchers()
+            self.update_stat_cards()
 
     def on_quick_schedule_changed(self, schedule_val: str):
         job = self.get_selected_job()
         if job:
             job.schedule_type = ScheduleType(schedule_val)
-            self.quick_interval_spin.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
+            self.quick_interval_picker.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
             self.init_timers_and_smart_watchers()
 
     def on_quick_interval_changed(self, interval_val: int):
@@ -1012,6 +1217,9 @@ class MainWindow(QMainWindow):
             self.watcher_status_lbl.setText("👁️ Auto-Sync: Idle")
             self.watcher_status_lbl.setStyleSheet("color: #8E8EA8; font-weight: normal;")
 
+        self.active_watchers_count = active_watchers_count
+        self.update_stat_cards()
+
     def on_watcher_error(self, job: SyncJob, message: str):
         self.log_output.append(f"⚠️ Watcher error for '{job.name}': {message}")
 
@@ -1102,6 +1310,12 @@ class MainWindow(QMainWindow):
         self.log_output.append(f"✅ Sync Finished. Operations: {len(actions)}\n")
         if not actions:
             self.set_diff_empty_state("No differences found — source and target are already in sync.")
+
+        finished_job = self.worker.job if self.worker else None
+        if finished_job and not self.worker.dry_run:
+            finished_job.last_run_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if self.get_selected_job() and self.get_selected_job().id == finished_job.id:
+                self.last_run_lbl.setText(f"🕓 Last synced: {finished_job.last_run_at}")
 
         if self.pending_job_ids:
             next_job_id = self.pending_job_ids.pop()

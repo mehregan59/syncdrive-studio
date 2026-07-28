@@ -49,3 +49,4 @@ class SyncJob(BaseModel):
         "System Volume Information",
     ]
     is_active: bool = True
+    last_run_at: Optional[str] = None      # ISO timestamp of last successful run
