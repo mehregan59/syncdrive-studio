@@ -54,7 +54,7 @@ from PyQt6.QtWidgets import (
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
     QProgressBar, QFileDialog, QGroupBox, QRadioButton, QSpinBox, QFrame,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QSplitter, QSystemTrayIcon, QMenu,
-    QStyle
+    QStyle, QListWidgetItem
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
 from PyQt6.QtGui import QIcon, QColor, QAction
@@ -62,12 +62,24 @@ from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
 from engine import SyncEngine
 from drive_detector import DriveWatcherThread
 
+def watchdog_observer_class():
+    """(Re-)check whether watchdog is importable right now and return its Observer
+    class, or None. Called lazily (not just once at startup) so that if the app
+    installs watchdog during this session (see DependencyInstallDialog), a newly
+    created SmartFolderWatcherManager can pick it up without restarting the app."""
+    try:
+        import importlib
+        observers_mod = importlib.import_module("watchdog.observers")
+        return observers_mod.Observer
+    except Exception:
+        return None
+
+
 try:
-    from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
-    WATCHDOG_AVAILABLE = True
 except ImportError:
-    WATCHDOG_AVAILABLE = False
+    class FileSystemEventHandler:  # dummy base so RobustChangeHandler always defines
+        pass
 
 
 # --- Thread-Safe Watchdog Signal Bridge ---
@@ -76,106 +88,117 @@ class WatchdogSignalBridge(QObject):
     watcher_error = pyqtSignal(str)      # (human-readable error message)
 
 
-if WATCHDOG_AVAILABLE:
-    class RobustChangeHandler(FileSystemEventHandler):
-        def __init__(self, bridge: WatchdogSignalBridge):
-            super().__init__()
-            self.bridge = bridge
+class RobustChangeHandler(FileSystemEventHandler):
+    def __init__(self, bridge: WatchdogSignalBridge):
+        super().__init__()
+        self.bridge = bridge
 
-        def _handle_event(self, event_type: str, src_path: str):
-            try:
-                # System files filter to prevent C-level thread crashes on drive roots
-                ignored_keywords = ["$RECYCLE.BIN", "System Volume Information", ".tmp", "~", "desktop.ini"]
-                if any(kw in src_path for kw in ignored_keywords):
-                    return
+    def _handle_event(self, event_type: str, src_path: str):
+        try:
+            # System files filter to prevent C-level thread crashes on drive roots
+            ignored_keywords = ["$RECYCLE.BIN", "System Volume Information", ".tmp", "~", "desktop.ini"]
+            if any(kw in src_path for kw in ignored_keywords):
+                return
 
-                # NOTE: every raw event is forwarded here. Debouncing/coalescing happens
-                # on the Qt-thread side (SmartFolderWatcherManager) via QTimer, so rapid
-                # successive changes are batched into one sync instead of being dropped.
-                filename = os.path.basename(src_path) or src_path
-                self.bridge.file_changed.emit(event_type, filename)
-            except Exception:
-                pass
+            # NOTE: every raw event is forwarded here. Debouncing/coalescing happens
+            # on the Qt-thread side (SmartFolderWatcherManager) via QTimer, so rapid
+            # successive changes are batched into one sync instead of being dropped.
+            filename = os.path.basename(src_path) or src_path
+            self.bridge.file_changed.emit(event_type, filename)
+        except Exception:
+            pass
 
-        def on_created(self, event):
-            self._handle_event("Created", event.src_path)
+    def on_created(self, event):
+        self._handle_event("Created", event.src_path)
 
-        def on_modified(self, event):
-            if not event.is_directory:
-                self._handle_event("Modified", event.src_path)
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._handle_event("Modified", event.src_path)
 
-        def on_deleted(self, event):
-            self._handle_event("Deleted", event.src_path)
+    def on_deleted(self, event):
+        self._handle_event("Deleted", event.src_path)
 
-        def on_moved(self, event):
-            dest = getattr(event, 'dest_path', event.src_path)
-            self._handle_event("Renamed", dest)
+    def on_moved(self, event):
+        dest = getattr(event, 'dest_path', event.src_path)
+        self._handle_event("Renamed", dest)
 
-    class SmartFolderWatcherManager:
-        def __init__(self, watch_paths: List[str], callback: Callable[[str, str], None], debounce_seconds: int = 1):
-            self.watch_paths = watch_paths
-            self.callback = callback
-            self.debounce_seconds = max(1, debounce_seconds)
-            self.active = False  # True once at least one path is actually being watched
 
-            self.bridge = WatchdogSignalBridge()
-            self.bridge.file_changed.connect(self._on_raw_change)
+class SmartFolderWatcherManager:
+    def __init__(self, watch_paths: List[str], callback: Callable[[str, str], None], debounce_seconds: int = 1):
+        self.watch_paths = watch_paths
+        self.callback = callback
+        self.debounce_seconds = max(1, debounce_seconds)
+        self.active = False  # True once at least one path is actually being watched
+        self._unavailable_error = None
 
-            self.handler = RobustChangeHandler(self.bridge)
-            self.observer = Observer()
+        self.bridge = WatchdogSignalBridge()
+        self.bridge.file_changed.connect(self._on_raw_change)
 
-            # Trailing-edge debounce timer lives on the Qt (main) thread, so bursts of
-            # filesystem events collapse into a single sync instead of being discarded.
-            self._debounce_timer = QTimer()
-            self._debounce_timer.setSingleShot(True)
-            self._debounce_timer.timeout.connect(self._fire_debounced_callback)
+        self.handler = RobustChangeHandler(self.bridge)
+        self.observer = None
+
+        ObserverCls = watchdog_observer_class()
+        if ObserverCls is None:
+            self._unavailable_error = "watchdog module is not installed — real-time watching can't run"
+        else:
+            self.observer = ObserverCls()
+
+        # Trailing-edge debounce timer lives on the Qt (main) thread, so bursts of
+        # filesystem events collapse into a single sync instead of being discarded.
+        self._debounce_timer = QTimer()
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.timeout.connect(self._fire_debounced_callback)
+        self._pending_event = None
+
+    def _on_raw_change(self, event_type: str, filename: str):
+        self._pending_event = (event_type, filename)
+        self._debounce_timer.start(self.debounce_seconds * 1000)
+
+    def _fire_debounced_callback(self):
+        if self._pending_event is not None:
+            event_type, filename = self._pending_event
             self._pending_event = None
+            self.callback(event_type, filename)
 
-        def _on_raw_change(self, event_type: str, filename: str):
-            self._pending_event = (event_type, filename)
-            self._debounce_timer.start(self.debounce_seconds * 1000)
+    def start(self):
+        if self.observer is None:
+            self.bridge.watcher_error.emit(self._unavailable_error or "watchdog unavailable")
+            return
 
-        def _fire_debounced_callback(self):
-            if self._pending_event is not None:
-                event_type, filename = self._pending_event
-                self._pending_event = None
-                self.callback(event_type, filename)
+        errors = []
+        scheduled_count = 0
+        for path_str in self.watch_paths:
+            clean_path = os.path.abspath(os.path.normpath(path_str))
+            if not os.path.exists(clean_path):
+                errors.append(f"Path does not exist: '{clean_path}'")
+                continue
+            try:
+                self.observer.schedule(self.handler, path=clean_path, recursive=True)
+                scheduled_count += 1
+            except Exception as e:
+                errors.append(f"Could not watch '{clean_path}': {e}")
 
-        def start(self):
-            errors = []
-            scheduled_count = 0
-            for path_str in self.watch_paths:
-                clean_path = os.path.abspath(os.path.normpath(path_str))
-                if not os.path.exists(clean_path):
-                    errors.append(f"Path does not exist: '{clean_path}'")
-                    continue
-                try:
-                    self.observer.schedule(self.handler, path=clean_path, recursive=True)
-                    scheduled_count += 1
-                except Exception as e:
-                    errors.append(f"Could not watch '{clean_path}': {e}")
+        if scheduled_count > 0:
+            try:
+                self.observer.start()
+                self.active = True
+            except Exception as e:
+                errors.append(f"Watcher failed to start: {e}")
+                self.active = False
 
-            if scheduled_count > 0:
-                try:
-                    self.observer.start()
-                    self.active = True
-                except Exception as e:
-                    errors.append(f"Watcher failed to start: {e}")
-                    self.active = False
+        if errors:
+            self.bridge.watcher_error.emit(" | ".join(errors))
 
-            if errors:
-                self.bridge.watcher_error.emit(" | ".join(errors))
-
-        def stop(self):
-            self._debounce_timer.stop()
-            if self.observer.is_alive():
-                self.observer.stop()
-                self.observer.join()
+    def stop(self):
+        self._debounce_timer.stop()
+        if self.observer is not None and self.observer.is_alive():
+            self.observer.stop()
+            self.observer.join()
 
 
 GOODSYNC_STUDIO_STYLESHEET = """
 QMainWindow {
-    background-color: #0F1017;
+    background-color: #000000;
 }
 
 QWidget {
@@ -186,7 +209,7 @@ QWidget {
 
 /* Top Toolbar Ribbon */
 #ToolbarFrame {
-    background-color: #181A26;
+    background-color: #0A0A0C;
     border-bottom: 1px solid #262838;
     padding: 8px 14px;
 }
@@ -268,13 +291,13 @@ QPushButton#StopBtn:disabled {
 
 /* Compact Connection Header Bar */
 #ConnectionHeader {
-    background-color: #14151F;
+    background-color: #0B0B0D;
     border-bottom: 1px solid #262838;
     padding: 8px 14px;
 }
 
 #PathCard {
-    background-color: #1A1C29;
+    background-color: #131316;
     border: 1px solid #2A2C40;
     border-radius: 8px;
     padding: 5px 12px;
@@ -282,7 +305,7 @@ QPushButton#StopBtn:disabled {
 
 /* Stat / Dashboard Cards */
 #StatCard {
-    background-color: #171826;
+    background-color: #0E0E11;
     border: 1px solid #262838;
     border-radius: 10px;
     padding: 8px 14px;
@@ -304,7 +327,7 @@ QPushButton#StopBtn:disabled {
 
 /* Trees & Tables */
 QTreeWidget, QListWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox {
-    background-color: #14151F;
+    background-color: #0B0B0D;
     border: 1px solid #262838;
     border-radius: 8px;
     padding: 5px;
@@ -318,7 +341,7 @@ QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button {
 }
 
 QHeaderView::section {
-    background-color: #1A1C29;
+    background-color: #131316;
     color: #8A8CAD;
     padding: 7px;
     border: none;
@@ -358,7 +381,7 @@ QCheckBox::indicator {
     height: 15px;
     border-radius: 4px;
     border: 1px solid #3A3C56;
-    background-color: #14151F;
+    background-color: #0B0B0D;
 }
 
 QCheckBox::indicator:checked {
@@ -370,7 +393,7 @@ QCheckBox::indicator:checked {
 QProgressBar {
     border: none;
     border-radius: 8px;
-    background-color: #14151F;
+    background-color: #0B0B0D;
     text-align: center;
     color: white;
     font-weight: bold;
@@ -515,6 +538,101 @@ class SetupWizardDialog(QDialog):
         self.status_lbl.setText("Status: Installation Complete!")
         time.sleep(0.3)
         self.accept()
+
+
+class DependencyInstallDialog(QDialog):
+    """Shown at startup when a required package (e.g. watchdog) couldn't be
+    auto-installed silently — GUI apps launched without a console never show
+    the print()-based install progress from auto_install_dependencies(), so
+    that install could be failing (no network, no permissions, etc.) with the
+    user never seeing why. This makes the attempt, its result, and a manual
+    fallback command all visible."""
+
+    def __init__(self, missing_packages: List[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("SyncDrive Studio - Missing Components")
+        self.setFixedSize(500, 380)
+        self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
+        self.missing_packages = list(missing_packages)
+        self.still_missing = list(missing_packages)
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Some components aren't installed yet")
+        title.setStyleSheet("font-size: 15px; font-weight: 800; color: #6C5CE7;")
+        layout.addWidget(title)
+
+        info = QLabel(
+            "SyncDrive Studio needs these Python packages for full functionality "
+            "(e.g. real-time file-change watching):\n\n• " + "\n• ".join(self.missing_packages)
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(150)
+        layout.addWidget(self.log_box)
+
+        btn_row = QHBoxLayout()
+        self.install_btn = QPushButton("📦 Install Now")
+        self.install_btn.setObjectName("RibbonBtnPrimary")
+        self.install_btn.clicked.connect(self.run_install)
+        btn_row.addWidget(self.install_btn)
+
+        self.copy_btn = QPushButton("Copy Manual Command")
+        self.copy_btn.setObjectName("RibbonBtn")
+        self.copy_btn.clicked.connect(self.copy_manual_command)
+        btn_row.addWidget(self.copy_btn)
+
+        self.continue_btn = QPushButton("Continue Without")
+        self.continue_btn.setObjectName("RibbonBtn")
+        self.continue_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.continue_btn)
+
+        layout.addLayout(btn_row)
+
+    def copy_manual_command(self):
+        cmd = f'"{sys.executable}" -m pip install {" ".join(self.missing_packages)}'
+        QApplication.clipboard().setText(cmd)
+        self.log_box.append(f"📋 Copied to clipboard:\n{cmd}\n")
+
+    def run_install(self):
+        self.install_btn.setEnabled(False)
+        self.log_box.append("Installing... this may take a minute.\n")
+        QApplication.processEvents()
+
+        still_missing = []
+        for pkg in list(self.still_missing):
+            self.log_box.append(f"→ pip install {pkg}")
+            QApplication.processEvents()
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", pkg],
+                    capture_output=True, text=True, timeout=180
+                )
+                if result.returncode == 0:
+                    self.log_box.append(f"   ✅ {pkg} installed successfully.\n")
+                else:
+                    still_missing.append(pkg)
+                    err = (result.stderr or result.stdout or "unknown error").strip()[-500:]
+                    self.log_box.append(f"   ❌ {pkg} failed:\n   {err}\n")
+            except Exception as e:
+                still_missing.append(pkg)
+                self.log_box.append(f"   ❌ {pkg} failed: {e}\n")
+            QApplication.processEvents()
+
+        self.still_missing = still_missing
+        if not still_missing:
+            self.log_box.append("🎉 All done. Real-time watching will now work.")
+            self.install_btn.setText("✅ Installed")
+        else:
+            self.log_box.append(
+                f"⚠️ Still missing: {', '.join(still_missing)}. "
+                "Retry, copy the manual command, or continue without these features."
+            )
+            self.install_btn.setEnabled(True)
+            self.install_btn.setText("🔁 Retry")
 
 
 class IntervalPicker(QWidget):
@@ -787,33 +905,12 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 1. Compact Top Ribbon Toolbar
+        # 1. Slim top toolbar — run actions + trigger controls only.
+        #    (Create/Edit/Delete/Pause moved to the left sidebar, see below.)
         toolbar = QFrame()
         toolbar.setObjectName("ToolbarFrame")
         tb_layout = QHBoxLayout(toolbar)
         tb_layout.setContentsMargins(8, 4, 8, 4)
-
-        btn_new = QPushButton("➕ New Job")
-        btn_new.setObjectName("RibbonBtn")
-        btn_new.clicked.connect(self.add_job)
-        tb_layout.addWidget(btn_new)
-
-        btn_edit = QPushButton("✏️ Edit Task")
-        btn_edit.setObjectName("RibbonBtn")
-        btn_edit.clicked.connect(self.edit_job)
-        tb_layout.addWidget(btn_edit)
-
-        btn_del = QPushButton("🗑️ Delete")
-        btn_del.setObjectName("RibbonBtn")
-        btn_del.clicked.connect(self.delete_job)
-        tb_layout.addWidget(btn_del)
-
-        self.btn_toggle_active = QPushButton("⏸ Pause Task")
-        self.btn_toggle_active.setObjectName("RibbonBtn")
-        self.btn_toggle_active.clicked.connect(self.toggle_selected_job_active)
-        tb_layout.addWidget(self.btn_toggle_active)
-
-        tb_layout.addSpacing(15)
 
         self.btn_analyze = QPushButton("🔍 Analyze (Preview)")
         self.btn_analyze.setObjectName("RibbonBtnPrimary")
@@ -858,24 +955,29 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(toolbar)
 
-        # 2. Compact Source <-> Target Header Bar
+        # 2. Source <-> Target <-> Last-synced strip — high-contrast, always legible
         conn_frame = QFrame()
         conn_frame.setObjectName("ConnectionHeader")
-        conn_frame.setFixedHeight(40)
+        conn_frame.setMinimumHeight(46)
         conn_layout = QHBoxLayout(conn_frame)
-        conn_layout.setContentsMargins(10, 2, 10, 2)
+        conn_layout.setContentsMargins(10, 4, 10, 4)
+
+        path_pill_style = (
+            "background-color: #171826; border: 1px solid #3A3C56; border-radius: 8px;"
+            " padding: 6px 12px; font-size: 13px; font-weight: 700;"
+        )
 
         src_card = QFrame()
         src_card.setObjectName("PathCard")
         src_c_layout = QHBoxLayout(src_card)
         src_c_layout.setContentsMargins(6, 2, 6, 2)
         self.src_lbl = QLabel("📁 Source: (Select a job)")
-        self.src_lbl.setStyleSheet("font-weight: bold; color: #00ADB5;")
+        self.src_lbl.setStyleSheet(f"{path_pill_style} color: #4FD1E3;")
         src_c_layout.addWidget(self.src_lbl)
         conn_layout.addWidget(src_card, 1)
 
         arrow_lbl = QLabel(" ↔ ")
-        arrow_lbl.setStyleSheet("font-size: 14px; font-weight: bold; color: #6C5CE7;")
+        arrow_lbl.setStyleSheet("font-size: 16px; font-weight: 900; color: #8778F0;")
         conn_layout.addWidget(arrow_lbl, 0, Qt.AlignmentFlag.AlignCenter)
 
         dst_card = QFrame()
@@ -883,7 +985,7 @@ class MainWindow(QMainWindow):
         dst_c_layout = QHBoxLayout(dst_card)
         dst_c_layout.setContentsMargins(6, 2, 6, 2)
         self.dst_lbl = QLabel("💾 Target: (Select a job)")
-        self.dst_lbl.setStyleSheet("font-weight: bold; color: #00B894;")
+        self.dst_lbl.setStyleSheet(f"{path_pill_style} color: #34E7A0;")
         dst_c_layout.addWidget(self.dst_lbl)
         conn_layout.addWidget(dst_card, 1)
 
@@ -892,16 +994,16 @@ class MainWindow(QMainWindow):
         last_run_c_layout = QHBoxLayout(last_run_card)
         last_run_c_layout.setContentsMargins(6, 2, 6, 2)
         self.last_run_lbl = QLabel("🕓 Last synced: —")
-        self.last_run_lbl.setStyleSheet("font-weight: bold; color: #B8BAD6;")
+        self.last_run_lbl.setStyleSheet(f"{path_pill_style} color: #E6E8F5;")
         last_run_c_layout.addWidget(self.last_run_lbl)
         conn_layout.addWidget(last_run_card, 1)
 
         layout.addWidget(conn_frame)
 
-        # 2b. Dashboard stat cards — quick at-a-glance overview
+        # 3. Dashboard stat cards — quick at-a-glance overview
         stats_frame = QFrame()
         stats_layout = QHBoxLayout(stats_frame)
-        stats_layout.setContentsMargins(14, 10, 14, 10)
+        stats_layout.setContentsMargins(14, 10, 14, 6)
         stats_layout.setSpacing(10)
 
         def make_stat_card(caption: str):
@@ -925,26 +1027,68 @@ class MainWindow(QMainWindow):
         stats_layout.addStretch()
         layout.addWidget(stats_frame)
 
-        # 3. Main Splitter View (No vast empty space)
+        # 4. Three-pane workspace: sidebar (create/tools/activity) | tasks | detail
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left Panel: Job Tree & Status Badge
-        left_widget = QWidget()
-        left_box = QVBoxLayout(left_widget)
-        left_box.setContentsMargins(4, 4, 4, 4)
+        # --- LEFT: sidebar ---
+        sidebar = QWidget()
+        sidebar_box = QVBoxLayout(sidebar)
+        sidebar_box.setContentsMargins(8, 8, 8, 8)
+        sidebar_box.setSpacing(10)
+
+        btn_new = QPushButton("➕  Create New Job")
+        btn_new.setObjectName("RibbonBtnPrimary")
+        btn_new.setMinimumHeight(38)
+        btn_new.clicked.connect(self.add_job)
+        sidebar_box.addWidget(btn_new)
+
+        tools_group = QGroupBox("Tools")
+        tools_box = QVBoxLayout(tools_group)
+        tools_box.setSpacing(6)
+
+        btn_edit = QPushButton("✏️  Edit Task")
+        btn_edit.setObjectName("RibbonBtn")
+        btn_edit.clicked.connect(self.edit_job)
+        tools_box.addWidget(btn_edit)
+
+        self.btn_toggle_active = QPushButton("⏸  Pause Task")
+        self.btn_toggle_active.setObjectName("RibbonBtn")
+        self.btn_toggle_active.clicked.connect(self.toggle_selected_job_active)
+        tools_box.addWidget(self.btn_toggle_active)
+
+        btn_del = QPushButton("🗑️  Delete Task")
+        btn_del.setObjectName("RibbonBtn")
+        btn_del.clicked.connect(self.delete_job)
+        tools_box.addWidget(btn_del)
+
+        sidebar_box.addWidget(tools_group)
+
+        activity_group = QGroupBox("Recent Activity")
+        activity_box = QVBoxLayout(activity_group)
+        self.recent_activity_list = QListWidget()
+        self.recent_activity_list.setStyleSheet("border: none; background: transparent;")
+        activity_box.addWidget(self.recent_activity_list)
+        sidebar_box.addWidget(activity_group, 1)
+
+        splitter.addWidget(sidebar)
+
+        # --- CENTER: task list ---
+        center_widget = QWidget()
+        center_box = QVBoxLayout(center_widget)
+        center_box.setContentsMargins(4, 4, 4, 4)
 
         self.watcher_status_lbl = QLabel("👁️ Live Auto-Sync: Idle")
         self.watcher_status_lbl.setStyleSheet("color: #00B894; font-weight: bold; padding: 2px;")
-        left_box.addWidget(self.watcher_status_lbl)
+        center_box.addWidget(self.watcher_status_lbl)
 
         self.job_tree = QTreeWidget()
         self.job_tree.setHeaderLabel("All Sync Tasks")
         self.job_tree.currentItemChanged.connect(self.on_job_tree_selected)
-        left_box.addWidget(self.job_tree)
+        center_box.addWidget(self.job_tree)
 
-        splitter.addWidget(left_widget)
+        splitter.addWidget(center_widget)
 
-        # Right Panel: Diff Comparison View + Realtime Log Output
+        # --- RIGHT: diff comparison + log ---
         right_container = QWidget()
         rc_layout = QVBoxLayout(right_container)
         rc_layout.setContentsMargins(4, 4, 4, 4)
@@ -976,9 +1120,9 @@ class MainWindow(QMainWindow):
         rc_layout.addWidget(self.log_output, 1)
 
         splitter.addWidget(right_container)
-        splitter.setSizes([230, 920])
+        splitter.setSizes([220, 380, 550])
 
-        layout.addWidget(splitter)
+        layout.addWidget(splitter, 1)
         self.setCentralWidget(main_widget)
 
     def init_system_tray(self):
@@ -1181,7 +1325,7 @@ class MainWindow(QMainWindow):
                 self.log_output.append(f"⏱️ Scheduled timer active: '{job.name}' ({job.interval_minutes}m)")
 
             elif job.schedule_type == ScheduleType.ON_FILE_CHANGE:
-                if not WATCHDOG_AVAILABLE:
+                if watchdog_observer_class() is None:
                     watcher_warnings.append(f"'{job.name}': real-time watching module ('watchdog') is not installed/bundled in this build.")
                     continue
 
@@ -1317,6 +1461,15 @@ class MainWindow(QMainWindow):
             if self.get_selected_job() and self.get_selected_job().id == finished_job.id:
                 self.last_run_lbl.setText(f"🕓 Last synced: {finished_job.last_run_at}")
 
+        if finished_job:
+            icon = "✅" if actions or not self.worker.dry_run else "ℹ️"
+            time_str = datetime.now().strftime("%H:%M")
+            mode_tag = "Preview" if self.worker.dry_run else "Synced"
+            entry = QListWidgetItem(f"{icon} {finished_job.name} — {mode_tag} · {len(actions)} change(s) · {time_str}")
+            self.recent_activity_list.insertItem(0, entry)
+            while self.recent_activity_list.count() > 25:
+                self.recent_activity_list.takeItem(self.recent_activity_list.count() - 1)
+
         if self.pending_job_ids:
             next_job_id = self.pending_job_ids.pop()
             next_job = next((j for j in self.jobs if j.id == next_job_id), None)
@@ -1348,6 +1501,12 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    if not getattr(sys, 'frozen', False):
+        still_missing = [pkg for pkg, imp in REQUIRED_PACKAGES.items() if importlib.util.find_spec(imp) is None]
+        if still_missing:
+            dep_dialog = DependencyInstallDialog(still_missing)
+            dep_dialog.exec()
 
     if getattr(sys, 'frozen', False):
         exe_path = pathlib.Path(sys.executable)
