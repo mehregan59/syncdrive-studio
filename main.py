@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import uuid
+import json
 import shutil
 import subprocess
 import importlib.util
@@ -429,17 +430,19 @@ class AppMode(str, Enum):
     INSTALLED = "installed"
 
 
-def create_windows_shortcut(target_exe: pathlib.Path, shortcut_path: pathlib.Path, icon_path: pathlib.Path = None):
+def create_windows_shortcut(target_exe: pathlib.Path, shortcut_path: pathlib.Path, icon_path: pathlib.Path = None, arguments: str = ""):
     if not sys.platform.startswith("win"):
         return
 
     icon_str = f'oLink.IconLocation = "{icon_path}"' if icon_path and icon_path.exists() else ''
+    args_str = f'oLink.Arguments = "{arguments}"' if arguments else ''
     vbs_script = f"""
     Set oWS = WScript.CreateObject("WScript.Shell")
     sLinkFile = "{shortcut_path}"
     Set oLink = oWS.CreateShortcut(sLinkFile)
     oLink.TargetPath = "{target_exe}"
     oLink.WorkingDirectory = "{target_exe.parent}"
+    {args_str}
     {icon_str}
     oLink.Save
     """
@@ -450,6 +453,124 @@ def create_windows_shortcut(target_exe: pathlib.Path, shortcut_path: pathlib.Pat
         vbs_path.unlink(missing_ok=True)
     except Exception as e:
         print(f"Shortcut creation failed: {e}")
+
+
+UNINSTALL_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\SyncDriveStudio"
+
+
+def register_windows_uninstaller(install_dir: pathlib.Path, exe_path: pathlib.Path, icon_path: pathlib.Path = None):
+    """Adds an entry to Windows 'Apps & Features' / 'Add or Remove Programs' so
+    the app can be found and uninstalled the normal way, instead of only via a
+    script buried in the install folder that most users would never find."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_REGISTRY_KEY) as key:
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "SyncDrive Studio")
+            winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, f'"{exe_path}" --uninstall')
+            winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, str(install_dir))
+            if icon_path and icon_path.exists():
+                winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, str(icon_path))
+            winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "SyncDrive Studio")
+            winreg.SetValueEx(key, "NoModify", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
+    except Exception as e:
+        print(f"Could not register uninstaller: {e}")
+
+
+def unregister_windows_uninstaller():
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import winreg
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_REGISTRY_KEY)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"Could not remove uninstaller registry entry: {e}")
+
+
+def run_uninstall_flow(install_dir: pathlib.Path, is_portable: bool):
+    """Removes shortcuts, the registry entry, saved app data, and (for a System
+    Install) the installed program folder itself. Asks for confirmation first."""
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    msg_box = QMessageBox()
+    msg_box.setWindowTitle("Uninstall SyncDrive Studio")
+    msg_box.setText("Are you sure you want to completely remove SyncDrive Studio?")
+    msg_box.setInformativeText(
+        "This will delete all saved job configurations, activity logs, "
+        + ("and the desktop/Start Menu shortcuts." if is_portable else
+           "shortcuts, and the installed program folder.")
+    )
+    msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    msg_box.setDefaultButton(QMessageBox.StandardButton.No)
+    if msg_box.exec() != QMessageBox.StandardButton.Yes:
+        return
+
+    removed = []
+    errors = []
+
+    # 1. App data (saved jobs, config) — both portable and installed modes
+    for app_data_dir in {pathlib.Path.home() / ".syncdrive_studio", install_dir / ".config"}:
+        if app_data_dir.exists():
+            try:
+                shutil.rmtree(app_data_dir)
+                removed.append(str(app_data_dir))
+            except Exception as e:
+                errors.append(f"{app_data_dir}: {e}")
+
+    # 2. Shortcuts
+    for shortcut in [
+        pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk",
+        pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk",
+        pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "Uninstall SyncDrive Studio.lnk",
+    ]:
+        if shortcut.exists():
+            try:
+                shortcut.unlink()
+                removed.append(str(shortcut))
+            except Exception as e:
+                errors.append(f"{shortcut}: {e}")
+
+    # 3. Windows "Add or Remove Programs" entry
+    unregister_windows_uninstaller()
+
+    if errors:
+        QMessageBox.warning(
+            None, "Uninstall — Some Items Could Not Be Removed",
+            "Removed:\n" + "\n".join(removed) + "\n\nCould not remove:\n" + "\n".join(errors)
+        )
+    else:
+        QMessageBox.information(
+            None, "Uninstall Complete",
+            "SyncDrive Studio settings, shortcuts, and data have been removed."
+            + ("" if is_portable else
+               "\n\nThe program folder will finish removing itself in a few seconds "
+               "after this window closes (it can't delete itself while running).")
+        )
+
+    # 4. Installed program folder — the running .exe can't delete itself directly
+    # on Windows, so hand off to a short-lived batch script that waits for this
+    # process to exit, then deletes the folder.
+    if not is_portable and sys.platform.startswith("win") and install_dir.exists():
+        bat_path = pathlib.Path(os.environ.get("TEMP", "C:/Windows/Temp")) / "syncdrive_studio_cleanup.bat"
+        bat_script = f"""@echo off
+timeout /t 2 /nobreak > NUL
+rmdir /s /q "{install_dir}"
+del "%~f0"
+"""
+        try:
+            bat_path.write_text(bat_script)
+            subprocess.Popen(
+                ["cmd", "/c", str(bat_path)],
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            )
+        except Exception as e:
+            print(f"Could not schedule folder cleanup: {e}")
+
+    sys.exit(0)
 
 
 class SetupWizardDialog(QDialog):
@@ -920,16 +1041,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
 
         self.engine = SyncEngine()
-        self.jobs = [
-            SyncJob(
-                name="Smart Photo Backup",
-                sources=["C:/Data"],
-                targets=["E:/BackupDrive"],
-                mode=SyncMode.ONE_WAY_BACKUP,
-                schedule_type=ScheduleType.ON_FILE_CHANGE,
-                interval_minutes=15
-            )
-        ]
+        self.jobs = self.load_jobs_from_disk()
 
         self.smart_watchers = []
         self.pending_job_ids = set()  # jobs whose file-change trigger fired while busy
@@ -1186,14 +1298,23 @@ class MainWindow(QMainWindow):
         quit_action = QAction("Exit Completely", self)
         quit_action.triggered.connect(self.exit_app_completely)
 
+        uninstall_action = QAction("Uninstall SyncDrive Studio...", self)
+        uninstall_action.triggered.connect(self.launch_uninstaller)
+
         tray_menu.addAction(show_action)
         tray_menu.addAction(hide_action)
         tray_menu.addSeparator()
+        tray_menu.addAction(uninstall_action)
         tray_menu.addAction(quit_action)
 
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self.on_tray_icon_activated)
         self.tray_icon.show()
+
+    def launch_uninstaller(self):
+        is_portable = self.app_mode == AppMode.PORTABLE
+        install_dir = self.install_dir or self.config_dir
+        run_uninstall_flow(install_dir, is_portable)
 
     def show_normal_and_raise(self):
         self.showNormal()
@@ -1250,6 +1371,33 @@ class MainWindow(QMainWindow):
         self.stat_active_watchers_lbl.setText(str(active_watchers))
         self.stat_paused_lbl.setText(str(paused))
 
+    JOBS_FILE_NAME = "jobs.json"
+
+    def load_jobs_from_disk(self) -> List[SyncJob]:
+        """Loads previously saved jobs. Called before init_ui(), so this can't
+        log to the UI yet — any load failure is silently treated as 'no saved
+        jobs' rather than crashing startup."""
+        jobs_path = self.config_dir / self.JOBS_FILE_NAME
+        if not jobs_path.exists():
+            return []
+        try:
+            raw = json.loads(jobs_path.read_text(encoding="utf-8"))
+            return [SyncJob(**item) for item in raw]
+        except Exception:
+            return []
+
+    def save_jobs_to_disk(self):
+        """Persists the current job list. Called after every job create/edit/
+        delete/pause/trigger-change and after each sync completes, so nothing
+        the user configured is lost on restart."""
+        jobs_path = self.config_dir / self.JOBS_FILE_NAME
+        try:
+            data = [json.loads(j.model_dump_json()) for j in self.jobs]
+            jobs_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            if hasattr(self, "log_output"):
+                self.log_output.append(f"⚠️ Failed to save job configuration: {e}")
+
     def get_selected_job(self) -> SyncJob:
         item = self.job_tree.currentItem()
         if item and item.data(0, Qt.ItemDataRole.UserRole):
@@ -1293,6 +1441,7 @@ class MainWindow(QMainWindow):
             self.refresh_job_tree()
             self.init_timers_and_smart_watchers()
             self.update_stat_cards()
+            self.save_jobs_to_disk()
 
     def on_quick_schedule_changed(self, schedule_val: str):
         job = self.get_selected_job()
@@ -1300,12 +1449,14 @@ class MainWindow(QMainWindow):
             job.schedule_type = ScheduleType(schedule_val)
             self.quick_interval_picker.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
             self.init_timers_and_smart_watchers()
+            self.save_jobs_to_disk()
 
     def on_quick_interval_changed(self, interval_val: int):
         job = self.get_selected_job()
         if job:
             job.interval_minutes = interval_val
             self.init_timers_and_smart_watchers()
+            self.save_jobs_to_disk()
 
     def add_job(self):
         dialog = ModernJobDialog(self)
@@ -1315,6 +1466,7 @@ class MainWindow(QMainWindow):
                 self.jobs.append(new_job)
                 self.refresh_job_tree()
                 self.init_timers_and_smart_watchers()
+                self.save_jobs_to_disk()
 
     def edit_job(self):
         job = self.get_selected_job()
@@ -1327,6 +1479,7 @@ class MainWindow(QMainWindow):
                     self.jobs[idx] = updated_job
                     self.refresh_job_tree()
                     self.init_timers_and_smart_watchers()
+                    self.save_jobs_to_disk()
 
     def delete_job(self):
         job = self.get_selected_job()
@@ -1334,6 +1487,7 @@ class MainWindow(QMainWindow):
             self.jobs.remove(job)
             self.refresh_job_tree()
             self.init_timers_and_smart_watchers()
+            self.save_jobs_to_disk()
 
     def init_drive_watcher(self):
         self.watcher = DriveWatcherThread()
@@ -1498,6 +1652,7 @@ class MainWindow(QMainWindow):
         finished_job = self.worker.job if self.worker else None
         if finished_job and not self.worker.dry_run:
             finished_job.last_run_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.save_jobs_to_disk()
             if self.get_selected_job() and self.get_selected_job().id == finished_job.id:
                 self.last_run_lbl.setText(f"🕓 Last synced: {finished_job.last_run_at}")
 
@@ -1541,6 +1696,18 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    if "--uninstall" in sys.argv:
+        # Reached via the Start Menu "Uninstall SyncDrive Studio" shortcut, or
+        # via Windows Settings > Apps (registered in register_windows_uninstaller).
+        if getattr(sys, 'frozen', False):
+            _exe_dir_for_uninstall = pathlib.Path(sys.executable).parent
+        else:
+            _exe_dir_for_uninstall = pathlib.Path(__file__).parent
+        _mode_file = _exe_dir_for_uninstall / ".app_mode"
+        _is_portable = _mode_file.exists() and _mode_file.read_text().strip() == AppMode.PORTABLE.value
+        run_uninstall_flow(_exe_dir_for_uninstall, _is_portable)
+        sys.exit(0)
 
     if not getattr(sys, 'frozen', False):
         still_missing = [pkg for pkg, imp in REQUIRED_PACKAGES.items() if importlib.util.find_spec(imp) is None]
@@ -1596,10 +1763,13 @@ if __name__ == "__main__":
 
             desktop_shortcut = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
             start_menu_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
+            uninstall_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "Uninstall SyncDrive Studio.lnk"
             icon_file = exe_dir / "app_icon.ico"
 
             create_windows_shortcut(installed_exe, desktop_shortcut, icon_file)
             create_windows_shortcut(installed_exe, start_menu_shortcut, icon_file)
+            create_windows_shortcut(installed_exe, uninstall_shortcut, icon_file, arguments="--uninstall")
+            register_windows_uninstaller(target_install_dir, installed_exe, icon_file)
         except PermissionError:
             if sys.platform.startswith("win"):
                 QMessageBox.warning(
