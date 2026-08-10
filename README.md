@@ -72,8 +72,9 @@ icon and choose **Uninstall SyncDrive Studio...**.
 
 ## Building it yourself
 
-You don't need any programming experience for this — just follow the steps.
-It only works on **Windows**.
+You don't need any programming experience for this — just follow the steps
+**exactly as written**, including which commands do and don't start with
+`python`. It only works on **Windows**.
 
 **1. Install Python** (skip if you already have it)
 Go to [python.org/downloads](https://www.python.org/downloads/), download
@@ -92,26 +93,36 @@ type `cmd`, and press Enter. A black terminal window will open already
 pointed at the right folder.
 
 **4. Install the required packages**
-Paste this and press Enter:
+Copy this whole line, paste it into the terminal, and press Enter:
 ```bash
 pip install -r requirements.txt
 ```
+This starts with `pip`, not `python` — type it exactly like that. It'll
+print a bunch of text while it downloads things; that's normal. Wait for it
+to finish and give you a new blank line before continuing.
 
 **5. Build the app**
-Paste this and press Enter:
+Copy this whole line, paste it into the terminal, and press Enter:
 ```bash
-pyinstaller syncdrive_studio.spec
+python -m PyInstaller syncdrive_studio.spec
 ```
-This takes a minute or two. When it finishes, your app is at:
+This one *does* start with `python -m` — don't leave that part out, and
+don't add an extra `python` in front of the whole thing either (a command
+like `python pyinstaller syncdrive_studio.spec` will fail with
+`can't open file 'pyinstaller'`, because `pyinstaller` isn't a script for
+Python to open — it's the name of the tool itself).
+
+This takes a minute or two and prints a lot of text — that's normal. When it
+finishes, your app is at:
 ```
 dist\SyncDriveStudio.exe
 ```
 That `.exe` is the finished program — copy it wherever you like and run it.
 
-> ⚠️ Don't build with `pyinstaller main.py` instead of the command above —
-> it skips a setting the `.spec` file adds, and real-time file watching
-> silently won't work in the result. See **[BUILD.md](./BUILD.md)** for why,
-> and how to tell if this happened to you.
+> ⚠️ Don't build with `python -m PyInstaller main.py` (pointing at `main.py`
+> instead of `syncdrive_studio.spec`) — it skips a setting the `.spec` file
+> adds, and real-time file watching silently won't work in the result. See
+> **[BUILD.md](./BUILD.md)** for why, and how to tell if this happened to you.
 
 **Prefer to just run it without building an .exe?**
 ```bash
