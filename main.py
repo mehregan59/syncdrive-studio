@@ -1594,18 +1594,34 @@ class MainWindow(QMainWindow):
         self.btn_analyze.setEnabled(False)
         self.btn_sync.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.progress_bar.setValue(0)
+        # plan_job() below runs synchronously and reports no progress while it
+        # walks the folders — that's usually the slowest part. An indeterminate
+        # (pulsing) bar during that phase means the bar isn't just frozen at 0%
+        # with no feedback; it switches to a real percentage once actions are
+        # known and being applied (see the progress_update handler below).
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("🔍 Scanning...")
         self.diff_tree.clear()
 
         mode_str = "ANALYZE PREVIEW" if dry_run else "LIVE SYNC"
         self.log_output.append(f"\n--- Running '{job.name}' [{mode_str}] ---")
 
         self.worker = SyncWorker(self.engine, job, dry_run)
-        self.worker.progress_update.connect(lambda pct, msg: (self.progress_bar.setValue(pct), self.log_output.append(msg)))
+        self.worker.progress_update.connect(self._on_worker_progress)
         self.worker.action_item_signal.connect(self.add_diff_tree_item)
         self.worker.error_signal.connect(lambda err: QMessageBox.critical(self, "Error", err))
         self.worker.finished_signal.connect(self.on_sync_finished)
         self.worker.start()
+
+    def _on_worker_progress(self, pct: int, msg: str):
+        if self.progress_bar.maximum() == 0:
+            # First real progress update means plan_job() has finished scanning
+            # and we now know how many actions there are — switch out of the
+            # pulsing scan indicator into an actual percentage.
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setFormat("%p%")
+        self.progress_bar.setValue(pct)
+        self.log_output.append(msg)
 
     def set_diff_empty_state(self, message: str):
         self.diff_tree.clear()
@@ -1644,6 +1660,9 @@ class MainWindow(QMainWindow):
         self.btn_analyze.setEnabled(True)
         self.btn_sync.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        if self.progress_bar.maximum() == 0:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setFormat("%p%")
         self.progress_bar.setValue(100)
         self.log_output.append(f"✅ Sync Finished. Operations: {len(actions)}\n")
         if not actions:
@@ -1726,7 +1745,7 @@ if __name__ == "__main__":
     selected_mode = None
     target_install_dir = None
 
-    is_installed_instance = mode_file.exists() and (exe_dir.name == "SyncDrive Studio")
+    is_installed_instance = mode_file.exists()
 
     if is_installed_instance:
         selected_mode = AppMode.PORTABLE if mode_file.read_text().strip() == AppMode.PORTABLE.value else AppMode.INSTALLED
