@@ -72,38 +72,52 @@ icon and choose **Uninstall SyncDrive Studio...**.
 
 ## Building it yourself
 
-You'll need Python 3.10+ on Windows.
+You don't need any programming experience for this — just follow the steps.
+It only works on **Windows**.
 
+**1. Install Python** (skip if you already have it)
+Go to [python.org/downloads](https://www.python.org/downloads/), download
+the latest version, and run the installer.
+⚠️ **On the first install screen, check the box "Add python.exe to PATH"**
+before clicking Install — this is the step people usually miss.
+
+**2. Download this project**
+Click the green **Code** button at the top of this page → **Download ZIP** →
+unzip it somewhere easy to find, like your Desktop.
+*(Or, if you have Git: `git clone https://github.com/mehregan59/syncdrive-studio.git`)*
+
+**3. Open a terminal in that folder**
+In the unzipped folder, click the address bar at the top of File Explorer,
+type `cmd`, and press Enter. A black terminal window will open already
+pointed at the right folder.
+
+**4. Install the required packages**
+Paste this and press Enter:
 ```bash
-# 1. Clone the repo
-git clone https://github.com/mehregan59/syncdrive-studio.git
-cd syncdrive-studio
-
-# 2. (Recommended) use a clean virtual environment
-python -m venv build_env
-build_env\Scripts\activate
-
-# 3. Install dependencies — this includes PyInstaller and watchdog
 pip install -r requirements.txt
-
-# 4. Build using the provided spec file (NOT `pyinstaller main.py` directly —
-#    the spec file explicitly bundles watchdog's platform-specific backend,
-#    which PyInstaller's automatic scanner tends to miss)
-pyinstaller syncdrive_studio.spec
 ```
 
-The finished executable is at `dist/SyncDriveStudio.exe`.
+**5. Build the app**
+Paste this and press Enter:
+```bash
+pyinstaller syncdrive_studio.spec
+```
+This takes a minute or two. When it finishes, your app is at:
+```
+dist\SyncDriveStudio.exe
+```
+That `.exe` is the finished program — copy it wherever you like and run it.
 
-**Running from source instead of building an .exe:**
+> ⚠️ Don't build with `pyinstaller main.py` instead of the command above —
+> it skips a setting the `.spec` file adds, and real-time file watching
+> silently won't work in the result. See **[BUILD.md](./BUILD.md)** for why,
+> and how to tell if this happened to you.
 
+**Prefer to just run it without building an .exe?**
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
-
-For a deeper explanation of *why* the spec file matters (and how to debug a
-build that still reports `watchdog` as missing), see
-**[BUILD.md](./BUILD.md)**.
 
 ---
 
