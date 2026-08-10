@@ -1279,12 +1279,17 @@ class MainWindow(QMainWindow):
         rc_layout.setContentsMargins(4, 4, 4, 4)
 
         self.diff_tree = QTreeWidget()
-        self.diff_tree.setHeaderLabels(["Action Item / File", "Left Source", "Direction", "Right Target", "Status"])
+        self.diff_tree.setHeaderLabels(["Source", "Action", "Target", "Details"])
         self.diff_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.diff_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.diff_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.diff_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.diff_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.diff_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.diff_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        self.diff_tree.setColumnWidth(3, 260)
+        # Filenames are the important part of each row and must never be
+        # truncated — full paths go in the tooltip instead of the visible
+        # cell, so there's no need to fight column width for the last
+        # segment of a long path.
+        self.diff_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         rc_layout.addWidget(self.diff_tree, 2)
         self._diff_showing_placeholder = False
         self.set_diff_empty_state("No file changes yet — click Analyze (Preview) or Sync Now to compare folders.")
@@ -1658,7 +1663,7 @@ class MainWindow(QMainWindow):
 
     def set_diff_empty_state(self, message: str):
         self.diff_tree.clear()
-        placeholder = QTreeWidgetItem(self.diff_tree, [message, "", "", "", ""])
+        placeholder = QTreeWidgetItem(self.diff_tree, [message, "", "", ""])
         placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
         font = placeholder.font(0)
         font.setItalic(True)
@@ -1674,20 +1679,44 @@ class MainWindow(QMainWindow):
             self.diagnostics_lbl.clear()
             self.diagnostics_lbl.setVisible(False)
 
+    ACTION_DISPLAY = {
+        "COPY_TO_TARGET": ("➡️", "Copying to target"),
+        "COPY_TO_SOURCE": ("⬅️", "Copying to source"),
+        "DELETE_TARGET": ("🗑️", "Deleting from target"),
+        "DELETE_SOURCE": ("🗑️", "Deleting from source"),
+    }
+
     def add_diff_tree_item(self, item_data: dict):
         if self._diff_showing_placeholder:
             self.diff_tree.clear()
             self._diff_showing_placeholder = False
-        direction = "➡️" if item_data["action_type"] == "COPY_TO_TARGET" else ("⬅️" if item_data["action_type"] == "COPY_TO_SOURCE" else "❌")
+
+        action_type = item_data["action_type"]
+        icon, label = self.ACTION_DISPLAY.get(action_type, ("•", action_type))
+
+        source_path = item_data["source"]
+        target_path = item_data["target"]
+        source_name = os.path.basename(source_path) if source_path != "-" else "—"
+        target_name = os.path.basename(target_path) if target_path != "-" else "—"
+
         tree_item = QTreeWidgetItem(self.diff_tree, [
-            os.path.basename(item_data["source"] if item_data["source"] != "-" else item_data["target"]),
-            item_data["source"],
-            direction,
-            item_data["target"],
+            source_name,
+            f"{icon} {label}",
+            target_name,
             item_data["reason"]
         ])
-        if item_data["action_type"] == "DELETE_TARGET":
-            tree_item.setForeground(4, QColor("#E74C3C"))
+        # Full paths live in the tooltip — the visible cell always shows just
+        # the filename in full, never truncated, since that's the part that
+        # actually matters when scanning a long list of changes.
+        if source_path != "-":
+            tree_item.setToolTip(0, source_path)
+        if target_path != "-":
+            tree_item.setToolTip(2, target_path)
+
+        if action_type in ("DELETE_TARGET", "DELETE_SOURCE"):
+            tree_item.setForeground(1, QColor("#E74C3C"))
+        elif action_type in ("COPY_TO_TARGET", "COPY_TO_SOURCE"):
+            tree_item.setForeground(1, QColor("#00B894"))
 
     def on_sync_finished(self, actions):
         self.btn_analyze.setEnabled(True)
