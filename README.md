@@ -123,17 +123,20 @@ build that still reports `watchdog` as missing), see
 
 ## License & attribution
 
-This project is licensed under the **[MIT License](./LICENSE)** — you're
-free to use, modify, and redistribute it, including commercially, as long as
-the original copyright notice is kept (standard MIT terms).
+This project is licensed under the **[Apache License 2.0](./LICENSE)**.
+You're free to use, modify, and redistribute it — including commercially —
+under these conditions:
 
-**If you reuse a meaningful part of this code in your own project, please
-credit it and link back to this repository:**
-👉 https://github.com/mehregan59/syncdrive-studio
+- **Keep the copyright and license notices** in the source.
+- **Note any changes you made** to the files you redistribute.
+- **Carry forward the [`NOTICE`](./NOTICE) file** in any distribution of this
+  software or a derivative of it (Apache 2.0 §4(d)). This is what makes
+  crediting the original project a real requirement rather than just a
+  courtesy — the `NOTICE` file points back here:
+  👉 https://github.com/mehregan59/syncdrive-studio
 
-It's not a legal requirement beyond what MIT already asks for (keeping the
-copyright notice), but it's appreciated and helps others find the original
-source.
+Apache 2.0 also includes an explicit patent grant, protecting anyone who
+uses this code from patent claims by its contributors.
 
 ---
 
