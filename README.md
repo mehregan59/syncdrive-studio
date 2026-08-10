@@ -130,6 +130,14 @@ pip install -r requirements.txt
 python main.py
 ```
 
+> ⚠️ **Rebuilding after already running the app once?** SyncDrive Studio
+> minimizes to the system tray instead of fully closing when you click the X.
+> If you see `PermissionError: Access is denied` on `dist\SyncDriveStudio.exe`
+> during a rebuild, the previous build is still running in the background —
+> right-click its icon in the system tray (bottom-right, near the clock) and
+> choose **Exit Completely**, or end `SyncDriveStudio.exe` in Task Manager,
+> then rebuild.
+
 ---
 
 ## Project structure
