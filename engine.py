@@ -2,7 +2,7 @@ import os
 import shutil
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
 from models import SyncJob, SyncMode, ConflictPolicy, SyncAction
 
 
@@ -30,8 +30,10 @@ class SyncEngine:
             return ""
 
     @staticmethod
-    def _resolve_conflict(src_file: Path, dst_file: Path, policy: ConflictPolicy) -> str:
-        """Determines transfer direction when a file exists in both source and target."""
+    def _resolve_conflict(src_mtime: float, dst_mtime: float, policy: ConflictPolicy) -> str:
+        """Determines transfer direction when a file exists in both source and
+        target. Takes mtimes directly (already known from the single scan) instead
+        of re-stat()'ing the files a third time."""
         if policy == ConflictPolicy.SOURCE_WINS:
             return "COPY_TO_TARGET"
         elif policy == ConflictPolicy.TARGET_WINS:
@@ -39,8 +41,6 @@ class SyncEngine:
         elif policy == ConflictPolicy.SKIP:
             return "SKIP"
         elif policy == ConflictPolicy.KEEP_NEWEST:
-            src_mtime = src_file.stat().st_mtime
-            dst_mtime = dst_file.stat().st_mtime
             if src_mtime > dst_mtime + 1.0:
                 return "COPY_TO_TARGET"
             elif dst_mtime > src_mtime + 1.0:
@@ -49,21 +49,59 @@ class SyncEngine:
         return "SKIP"
 
     @staticmethod
-    def _scan_relpaths(root: Path, exclude_patterns: List[str]) -> Set[str]:
-        """Returns the set of file paths under root, relative to root, as POSIX strings."""
-        found: Set[str] = set()
+    def _scan_with_stats(root: Path, exclude_patterns: List[str]) -> Dict[str, Tuple[int, float]]:
+        """Walks `root` exactly once and returns {relative_posix_path: (size, mtime)}
+        for every file under it.
+
+        Uses os.scandir directly (rather than os.walk + a separate Path.stat()
+        call per file) so each DirEntry's cached metadata is reused instead of
+        issuing a second stat syscall per file — on Windows, DirEntry.stat()
+        is populated from the same directory-listing call that discovered the
+        entry, so this avoids a redundant per-file round trip. That matters a
+        lot on external/USB/network drives, where a fresh stat() per file is a
+        real-latency random-access operation, not a free local call.
+
+        Callers should call this exactly once per root per sync and reuse the
+        result — re-walking the same tree multiple times per sync (as the
+        previous implementation did) is the single biggest avoidable cost for
+        large or slow drives.
+        """
+        result: Dict[str, Tuple[int, float]] = {}
         if not root.exists():
-            return found
-        for r, _, files in os.walk(root):
-            for file in files:
-                if any(file.endswith(ext) for ext in exclude_patterns):
-                    continue
-                rel = (Path(r) / file).relative_to(root).as_posix()
-                found.add(rel)
-        return found
+            return result
+
+        stack = [str(root)]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                if any(entry.name.endswith(ext) for ext in exclude_patterns):
+                                    continue
+                                st = entry.stat(follow_symlinks=False)
+                                rel = Path(entry.path).relative_to(root).as_posix()
+                                result[rel] = (st.st_size, st.st_mtime)
+                        except OSError:
+                            # Vanished mid-scan, permission denied, broken link, etc.
+                            # — skip that one entry rather than aborting the scan.
+                            continue
+            except OSError:
+                continue
+        return result
 
     def plan_job(self, job: SyncJob) -> List[SyncAction]:
-        """Calculates exact execution actions without modifying files (Dry-Run / Plan)."""
+        """Calculates exact execution actions without modifying files (Dry-Run / Plan).
+
+        Each source/target pair is scanned exactly once per side (via
+        _scan_with_stats), and every comparison — missing files, changed files,
+        extra files for Mirror mode, deletions for Two-Way mode — is done
+        in-memory against those two dicts. No path is ever stat()'d or walked
+        more than once during planning.
+        """
         actions: List[SyncAction] = []
 
         for src_str in job.sources:
@@ -76,46 +114,40 @@ class SyncEngine:
                 if not dst_root.exists():
                     continue
 
-                for root, _, files in os.walk(src_root):
-                    rel_path = Path(root).relative_to(src_root)
-                    dst_dir = dst_root / rel_path
+                src_map = self._scan_with_stats(src_root, job.exclude_patterns)
+                dst_map = self._scan_with_stats(dst_root, job.exclude_patterns)
 
-                    for file in files:
-                        if any(file.endswith(ext) for ext in job.exclude_patterns):
-                            continue
+                # Files present in source: missing-in-target, or present-but-different.
+                for rel, (s_size, s_mtime) in src_map.items():
+                    src_file = src_root / rel
+                    dst_file = dst_root / rel
+                    dst_entry = dst_map.get(rel)
 
-                        src_file = Path(root) / file
-                        dst_file = dst_dir / file
-
-                        if not dst_file.exists():
-                            actions.append(SyncAction(
-                                action_type="COPY_TO_TARGET",
-                                source_path=str(src_file),
-                                target_path=str(dst_file),
-                                reason="File missing in target"
-                            ))
-                        else:
-                            src_stat = src_file.stat()
-                            dst_stat = dst_file.stat()
-                            if src_stat.st_size != dst_stat.st_size or abs(src_stat.st_mtime - dst_stat.st_mtime) > 1.0:
-                                decision = self._resolve_conflict(src_file, dst_file, job.conflict_policy)
-                                if decision != "SKIP":
-                                    actions.append(SyncAction(
-                                        action_type=decision,
-                                        source_path=str(src_file),
-                                        target_path=str(dst_file),
-                                        reason=f"Conflict resolved via policy: {job.conflict_policy.value}"
-                                    ))
+                    if dst_entry is None:
+                        actions.append(SyncAction(
+                            action_type="COPY_TO_TARGET",
+                            source_path=str(src_file),
+                            target_path=str(dst_file),
+                            reason="File missing in target"
+                        ))
+                    else:
+                        d_size, d_mtime = dst_entry
+                        if s_size != d_size or abs(s_mtime - d_mtime) > 1.0:
+                            decision = self._resolve_conflict(s_mtime, d_mtime, job.conflict_policy)
+                            if decision != "SKIP":
+                                actions.append(SyncAction(
+                                    action_type=decision,
+                                    source_path=str(src_file),
+                                    target_path=str(dst_file),
+                                    reason=f"Conflict resolved via policy: {job.conflict_policy.value}"
+                                ))
 
                 if job.mode == SyncMode.TWO_WAY_SYNC:
-                    # Rebuilt below using known-state comparison instead of a
-                    # one-directional "missing in source -> copy from target"
-                    # walk, so deletions can be told apart from new files.
                     known = self._known_relpaths.get(job.id)
-                    src_relset = self._scan_relpaths(src_root, job.exclude_patterns)
-                    dst_relset = self._scan_relpaths(dst_root, job.exclude_patterns)
+                    src_keys = set(src_map)
+                    dst_keys = set(dst_map)
 
-                    only_in_target = dst_relset - src_relset
+                    only_in_target = dst_keys - src_keys
                     for rel in only_in_target:
                         dst_file = dst_root / rel
                         src_file = src_root / rel
@@ -135,10 +167,9 @@ class SyncEngine:
                                 reason="File missing in source (Two-Way Sync)"
                             ))
 
-                    only_in_source = src_relset - dst_relset
+                    only_in_source = src_keys - dst_keys
                     for rel in only_in_source:
                         src_file = src_root / rel
-                        dst_file = dst_root / rel
                         if known is not None and rel in known:
                             # Existed on both sides before, missing from target now
                             # -> it was deleted from target. Propagate the delete.
@@ -147,23 +178,18 @@ class SyncEngine:
                                 source_path=str(src_file),
                                 reason="Deleted from target — propagating delete (Two-Way Sync)"
                             ))
-                        # else: this is already covered by the first COPY_TO_TARGET
-                        # walk above (file present in source, missing in target).
+                        # else: already covered above (file present in source,
+                        # missing in target -> COPY_TO_TARGET).
 
                 elif job.mode == SyncMode.ONE_WAY_MIRROR:
-                    for root, _, files in os.walk(dst_root):
-                        rel_path = Path(root).relative_to(dst_root)
-                        src_dir = src_root / rel_path
-
-                        for file in files:
-                            dst_file = Path(root) / file
-                            src_file = src_dir / file
-                            if not src_file.exists():
-                                actions.append(SyncAction(
-                                    action_type="DELETE_TARGET",
-                                    target_path=str(dst_file),
-                                    reason="Extra file in target (Mirror mode)"
-                                ))
+                    extra_in_target = set(dst_map) - set(src_map)
+                    for rel in extra_in_target:
+                        dst_file = dst_root / rel
+                        actions.append(SyncAction(
+                            action_type="DELETE_TARGET",
+                            target_path=str(dst_file),
+                            reason="Extra file in target (Mirror mode)"
+                        ))
 
         return actions
 
@@ -171,20 +197,26 @@ class SyncEngine:
         """Call after a REAL (non-dry-run) sync completes, for TWO_WAY_SYNC jobs
         only. Snapshots which relative paths now exist on both sides, so the
         next plan_job() call can tell new files apart from deletions instead of
-        treating every 'missing on one side' the same way."""
+        treating every 'missing on one side' the same way.
+
+        This does its own scan (source and target each walked once) because it
+        runs after execute_job_instance has already finished copying/deleting —
+        the on-disk state has changed since plan_job's scan, so that earlier
+        scan can't be reused here without risking a stale snapshot.
+        """
         if job.mode != SyncMode.TWO_WAY_SYNC:
             return
         combined: Set[str] = set()
         for src_str in job.sources:
             src_root = Path(src_str)
-            src_relset = self._scan_relpaths(src_root, job.exclude_patterns)
+            src_keys = set(self._scan_with_stats(src_root, job.exclude_patterns))
             for target_str in job.targets:
                 dst_root = Path(target_str)
-                dst_relset = self._scan_relpaths(dst_root, job.exclude_patterns)
+                dst_keys = set(self._scan_with_stats(dst_root, job.exclude_patterns))
                 # Only paths present on both sides count as "known" — anything
                 # only on one side didn't successfully sync (e.g. a conflict
                 # skip) and shouldn't be assumed stable yet.
-                combined |= (src_relset & dst_relset)
+                combined |= (src_keys & dst_keys)
         self._known_relpaths[job.id] = combined
 
     def execute_job(self, job: SyncJob, dry_run: bool = False, progress_callback=None) -> List[SyncAction]:
