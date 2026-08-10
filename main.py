@@ -59,6 +59,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
 from PyQt6.QtGui import QIcon, QColor, QAction
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
 from engine import SyncEngine
 from drive_detector import DriveWatcherThread
@@ -571,6 +572,38 @@ del "%~f0"
             print(f"Could not schedule folder cleanup: {e}")
 
     sys.exit(0)
+
+
+SINGLE_INSTANCE_KEY = "SyncDriveStudio-SingleInstance-v1"
+
+
+def acquire_single_instance_or_notify_running():
+    """If another instance is already running, asks it (over a local socket)
+    to restore itself to the foreground — which un-minimizes it from the tray
+    the same way double-clicking the tray icon does — tells the user, and
+    returns None so the caller exits instead of opening a second window.
+    Otherwise starts listening for future launches and returns the server
+    (the caller must keep a reference to it for the app's lifetime)."""
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLE_INSTANCE_KEY)
+    if socket.waitForConnected(200):
+        socket.write(b"show")
+        socket.flush()
+        socket.waitForBytesWritten(200)
+        socket.disconnectFromServer()
+        QMessageBox.information(
+            None, "SyncDrive Studio",
+            "SyncDrive Studio is already running — bringing it to the front."
+        )
+        return None
+
+    # No server responded — either this is genuinely the first instance, or a
+    # previous instance crashed and left a stale server registration behind.
+    # removeServer() clears a stale one; it's a no-op if none exists.
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    server = QLocalServer()
+    server.listen(SINGLE_INSTANCE_KEY)
+    return server
 
 
 class SetupWizardDialog(QDialog):
@@ -1728,6 +1761,11 @@ if __name__ == "__main__":
         run_uninstall_flow(_exe_dir_for_uninstall, _is_portable)
         sys.exit(0)
 
+    single_instance_server = acquire_single_instance_or_notify_running()
+    if single_instance_server is None:
+        # Another instance responded and is being brought to the foreground.
+        sys.exit(0)
+
     if not getattr(sys, 'frozen', False):
         still_missing = [pkg for pkg, imp in REQUIRED_PACKAGES.items() if importlib.util.find_spec(imp) is None]
         if still_missing:
@@ -1799,5 +1837,7 @@ if __name__ == "__main__":
                 sys.exit(1)
 
     window = MainWindow(app_mode=selected_mode, config_dir=config_dir, install_dir=target_install_dir)
+    window.single_instance_server = single_instance_server
+    single_instance_server.newConnection.connect(window.show_normal_and_raise)
     window.show()
     sys.exit(app.exec())
