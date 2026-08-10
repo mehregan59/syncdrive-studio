@@ -33,7 +33,9 @@ class SyncEngine:
     def _resolve_conflict(src_mtime: float, dst_mtime: float, policy: ConflictPolicy) -> str:
         """Determines transfer direction when a file exists in both source and
         target. Takes mtimes directly (already known from the single scan) instead
-        of re-stat()'ing the files a third time."""
+        of re-stat()'ing the files a third time. Only used as a headless fallback
+        when no conflict_resolver is supplied to plan_job (e.g. programmatic/
+        non-interactive callers) — the interactive GUI path always asks instead."""
         if policy == ConflictPolicy.SOURCE_WINS:
             return "COPY_TO_TARGET"
         elif policy == ConflictPolicy.TARGET_WINS:
@@ -65,10 +67,22 @@ class SyncEngine:
         result — re-walking the same tree multiple times per sync (as the
         previous implementation did) is the single biggest avoidable cost for
         large or slow drives.
+
+        exclude_patterns are checked two ways: as a file-name suffix (so
+        ".tmp" skips individual files), AND as an exact (case-insensitive)
+        directory name — so "$RECYCLE.BIN" or "System Volume Information"
+        skip that entire folder and everything inside it, rather than only
+        filtering files whose own name happens to end with that string. That
+        second check used to be missing entirely: those default patterns are
+        folder names, not file suffixes, so they never matched anything via
+        the file-suffix check, and the scan walked straight into the recycle
+        bin / OS-reserved folders and synced whatever it found there.
         """
         result: Dict[str, Tuple[int, float]] = {}
         if not root.exists():
             return result
+
+        excluded_dir_names = {p.lower() for p in exclude_patterns}
 
         stack = [str(root)]
         while stack:
@@ -78,6 +92,8 @@ class SyncEngine:
                     for entry in it:
                         try:
                             if entry.is_dir(follow_symlinks=False):
+                                if entry.name.lower() in excluded_dir_names:
+                                    continue
                                 stack.append(entry.path)
                             elif entry.is_file(follow_symlinks=False):
                                 if any(entry.name.endswith(ext) for ext in exclude_patterns):
