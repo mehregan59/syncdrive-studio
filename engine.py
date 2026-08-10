@@ -93,7 +93,7 @@ class SyncEngine:
                 continue
         return result
 
-    def plan_job(self, job: SyncJob) -> List[SyncAction]:
+    def plan_job(self, job: SyncJob, conflict_resolver=None) -> List[SyncAction]:
         """Calculates exact execution actions without modifying files (Dry-Run / Plan).
 
         Each source/target pair is scanned exactly once per side (via
@@ -101,6 +101,17 @@ class SyncEngine:
         extra files for Mirror mode, deletions for Two-Way mode — is done
         in-memory against those two dicts. No path is ever stat()'d or walked
         more than once during planning.
+
+        conflict_resolver: optional callable(conflicts: list[dict]) -> dict.
+        Called once per source/target pair, with ALL conflicts found for that
+        pair (files present on both sides with different size/mtime) — never
+        per-file, so a caller can offer a single bulk decision alongside
+        per-file overrides instead of being asked once per file. Each conflict
+        dict has: relpath, source_path, target_path, src_size, src_mtime,
+        dst_size, dst_mtime. Must return {relpath: "COPY_TO_TARGET" |
+        "COPY_TO_SOURCE" | "SKIP"} — any relpath not in the returned dict is
+        treated as SKIP. If not provided, falls back to automatically deciding
+        via job.conflict_policy (used for headless/non-interactive callers).
         """
         actions: List[SyncAction] = []
 
@@ -118,6 +129,7 @@ class SyncEngine:
                 dst_map = self._scan_with_stats(dst_root, job.exclude_patterns)
 
                 # Files present in source: missing-in-target, or present-but-different.
+                conflicts: List[Dict] = []
                 for rel, (s_size, s_mtime) in src_map.items():
                     src_file = src_root / rel
                     dst_file = dst_root / rel
@@ -133,14 +145,37 @@ class SyncEngine:
                     else:
                         d_size, d_mtime = dst_entry
                         if s_size != d_size or abs(s_mtime - d_mtime) > 1.0:
-                            decision = self._resolve_conflict(s_mtime, d_mtime, job.conflict_policy)
-                            if decision != "SKIP":
-                                actions.append(SyncAction(
-                                    action_type=decision,
-                                    source_path=str(src_file),
-                                    target_path=str(dst_file),
-                                    reason=f"Conflict resolved via policy: {job.conflict_policy.value}"
-                                ))
+                            conflicts.append({
+                                "relpath": rel,
+                                "source_path": str(src_file),
+                                "target_path": str(dst_file),
+                                "src_size": s_size,
+                                "src_mtime": s_mtime,
+                                "dst_size": d_size,
+                                "dst_mtime": d_mtime,
+                            })
+
+                if conflicts:
+                    if conflict_resolver is not None:
+                        resolutions = conflict_resolver(conflicts) or {}
+                        reason_text = "Conflict resolved by user"
+                    else:
+                        resolutions = {
+                            c["relpath"]: self._resolve_conflict(c["src_mtime"], c["dst_mtime"], job.conflict_policy)
+                            for c in conflicts
+                        }
+                        reason_text = f"Conflict resolved via policy: {job.conflict_policy.value}"
+
+                    for c in conflicts:
+                        decision = resolutions.get(c["relpath"], "SKIP")
+                        if decision == "SKIP":
+                            continue
+                        actions.append(SyncAction(
+                            action_type=decision,
+                            source_path=c["source_path"],
+                            target_path=c["target_path"],
+                            reason=reason_text
+                        ))
 
                 if job.mode == SyncMode.TWO_WAY_SYNC:
                     known = self._known_relpaths.get(job.id)
