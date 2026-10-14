@@ -1,216 +1,63 @@
+"""
+SyncDrive Studio — simple one-way backup:  Main  ➜  Backup.
+
+Main is the original. Backup receives new and changed files from Main, never
+the other way around (except when YOU explicitly choose it for a single file).
+Nothing is ever erased: old versions and "deleted" files go to folders inside
+the Backup that you can open, restore from, and empty yourself.
+
+Licensed under the Apache License 2.0 — see LICENSE / NOTICE.
+https://github.com/mehregan59/syncdrive-studio
+"""
 import sys
 import os
 import time
-import uuid
 import json
 import shutil
 import subprocess
 import importlib.util
 import multiprocessing
 import pathlib
-import threading
 from datetime import datetime
 from enum import Enum
-from typing import List, Callable
+from typing import List
 
 # MUST call freeze_support at script load time for Windows PyInstaller single-file builds
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
-REQUIRED_PACKAGES = {
-    "PyQt6": "PyQt6",
-    "pydantic": "pydantic",
-    "psutil": "psutil",
-    "watchdog": "watchdog"
-}
+REQUIRED_PACKAGES = {"PyQt6": "PyQt6"}
+
 
 def auto_install_dependencies():
     missing = [pkg for pkg, imp in REQUIRED_PACKAGES.items() if importlib.util.find_spec(imp) is None]
-    if missing:
-        print("\n==================================================")
-        print(" [SyncDrive Studio] Installing Dependencies")
-        print(f" Packages: {', '.join(missing)}")
-        print("==================================================\n")
-        total = len(missing)
-        for idx, pkg in enumerate(missing, 1):
-            percent = int((idx / total) * 100)
-            bar = '█' * (percent // 5) + '-' * (20 - (percent // 5))
-            print(f"\rInstalling {pkg:<12} [{bar}] {percent}%", end="", flush=True)
-            try:
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", pkg],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-            except Exception as e:
-                print(f"\n❌ Error installing {pkg}: {e}")
-                sys.exit(1)
-        print("\n\n✅ Dependencies updated successfully!\n")
+    for pkg in missing:
+        print(f"Installing {pkg} ...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        except Exception as e:
+            print(f"Could not install {pkg}: {e}\nRun:  python -m pip install {pkg}")
+            sys.exit(1)
 
-if not getattr(sys, 'frozen', False):
+
+if not getattr(sys, "frozen", False):
     auto_install_dependencies()
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QListWidget, QPushButton, QLabel, QTextEdit, QCheckBox, QComboBox,
-    QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
-    QProgressBar, QFileDialog, QGroupBox, QRadioButton, QSpinBox, QFrame,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QSplitter, QSystemTrayIcon, QMenu,
-    QStyle, QListWidgetItem, QTableWidget, QTableWidgetItem
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QTextEdit, QPlainTextEdit, QCheckBox, QComboBox, QDialog, QLineEdit, QMessageBox,
+    QProgressBar, QFileDialog, QGroupBox, QRadioButton, QFrame, QHeaderView, QSplitter,
+    QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
-from PyQt6.QtGui import QIcon, QColor, QAction
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
+from PyQt6.QtGui import QIcon, QColor, QDesktopServices
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
-from models import SyncJob, SyncMode, ConflictPolicy, ScheduleType
-from engine import SyncEngine
-from drive_detector import DriveWatcherThread
 
-_watchdog_last_error = None  # holds the real exception text from the last failed attempt
-
-
-def watchdog_observer_class():
-    """(Re-)check whether watchdog is importable right now and return its Observer
-    class, or None. Called lazily (not just once at startup) so that if the app
-    installs watchdog during this session (see DependencyInstallDialog), a newly
-    created SmartFolderWatcherManager can pick it up without restarting the app.
-    On failure, stores the real exception in _watchdog_last_error so the UI can
-    show what actually went wrong instead of a generic 'not installed' message —
-    it could be a genuine missing-module error, or something else entirely
-    (DLL load failure, version mismatch, wrong Python env at build time, etc.)."""
-    global _watchdog_last_error
-    try:
-        import importlib
-        observers_mod = importlib.import_module("watchdog.observers")
-        _watchdog_last_error = None
-        return observers_mod.Observer
-    except Exception as e:
-        _watchdog_last_error = f"{type(e).__name__}: {e}"
-        return None
-
-
-try:
-    from watchdog.events import FileSystemEventHandler
-except ImportError:
-    class FileSystemEventHandler:  # dummy base so RobustChangeHandler always defines
-        pass
-
-
-# --- Thread-Safe Watchdog Signal Bridge ---
-class WatchdogSignalBridge(QObject):
-    file_changed = pyqtSignal(str, str)  # (event_type, path)
-    watcher_error = pyqtSignal(str)      # (human-readable error message)
-
-
-class RobustChangeHandler(FileSystemEventHandler):
-    def __init__(self, bridge: WatchdogSignalBridge):
-        super().__init__()
-        self.bridge = bridge
-
-    def _handle_event(self, event_type: str, src_path: str):
-        try:
-            # System files filter to prevent C-level thread crashes on drive roots
-            ignored_keywords = ["$RECYCLE.BIN", "System Volume Information", ".tmp", "~", "desktop.ini"]
-            if any(kw in src_path for kw in ignored_keywords):
-                return
-
-            # NOTE: every raw event is forwarded here. Debouncing/coalescing happens
-            # on the Qt-thread side (SmartFolderWatcherManager) via QTimer, so rapid
-            # successive changes are batched into one sync instead of being dropped.
-            filename = os.path.basename(src_path) or src_path
-            self.bridge.file_changed.emit(event_type, filename)
-        except Exception:
-            pass
-
-    def on_created(self, event):
-        self._handle_event("Created", event.src_path)
-
-    def on_modified(self, event):
-        if not event.is_directory:
-            self._handle_event("Modified", event.src_path)
-
-    def on_deleted(self, event):
-        self._handle_event("Deleted", event.src_path)
-
-    def on_moved(self, event):
-        dest = getattr(event, 'dest_path', event.src_path)
-        self._handle_event("Renamed", dest)
-
-
-class SmartFolderWatcherManager:
-    def __init__(self, watch_paths: List[str], callback: Callable[[str, str], None], debounce_seconds: int = 1):
-        self.watch_paths = watch_paths
-        self.callback = callback
-        self.debounce_seconds = max(1, debounce_seconds)
-        self.active = False  # True once at least one path is actually being watched
-        self._unavailable_error = None
-
-        self.bridge = WatchdogSignalBridge()
-        self.bridge.file_changed.connect(self._on_raw_change)
-
-        self.handler = RobustChangeHandler(self.bridge)
-        self.observer = None
-
-        ObserverCls = watchdog_observer_class()
-        if ObserverCls is None:
-            self._unavailable_error = f"watchdog unavailable — {_watchdog_last_error or 'unknown import failure'}"
-        else:
-            self.observer = ObserverCls()
-
-        # Trailing-edge debounce timer lives on the Qt (main) thread, so bursts of
-        # filesystem events collapse into a single sync instead of being discarded.
-        self._debounce_timer = QTimer()
-        self._debounce_timer.setSingleShot(True)
-        self._debounce_timer.timeout.connect(self._fire_debounced_callback)
-        self._pending_event = None
-
-    def _on_raw_change(self, event_type: str, filename: str):
-        self._pending_event = (event_type, filename)
-        self._debounce_timer.start(self.debounce_seconds * 1000)
-
-    def _fire_debounced_callback(self):
-        if self._pending_event is not None:
-            event_type, filename = self._pending_event
-            self._pending_event = None
-            self.callback(event_type, filename)
-
-    def start(self):
-        if self.observer is None:
-            self.bridge.watcher_error.emit(self._unavailable_error or "watchdog unavailable")
-            return
-
-        errors = []
-        scheduled_count = 0
-        for path_str in self.watch_paths:
-            clean_path = os.path.abspath(os.path.normpath(path_str))
-            if not os.path.exists(clean_path):
-                errors.append(f"Path does not exist: '{clean_path}'")
-                continue
-            try:
-                self.observer.schedule(self.handler, path=clean_path, recursive=True)
-                scheduled_count += 1
-            except Exception as e:
-                errors.append(f"Could not watch '{clean_path}': {e}")
-
-        if scheduled_count > 0:
-            try:
-                self.observer.start()
-                self.active = True
-            except Exception as e:
-                errors.append(f"Watcher failed to start: {e}")
-                self.active = False
-
-        if errors:
-            self.bridge.watcher_error.emit(" | ".join(errors))
-
-    def stop(self):
-        self._debounce_timer.stop()
-        if self.observer is not None and self.observer.is_alive():
-            self.observer.stop()
-            self.observer.join()
+import engine as eng
 
 
 GOODSYNC_STUDIO_STYLESHEET = """
-QMainWindow {
+QMainWindow, QDialog, QMessageBox {
     background-color: #000000;
 }
 
@@ -339,7 +186,7 @@ QPushButton#StopBtn:disabled {
 }
 
 /* Trees & Tables */
-QTreeWidget, QListWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox {
+QTreeWidget, QTableWidget, QPlainTextEdit, QListWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox {
     background-color: #0B0B0D;
     border: 1px solid #262838;
     border-radius: 8px;
@@ -364,12 +211,12 @@ QHeaderView::section {
     letter-spacing: 0.4px;
 }
 
-QTreeWidget::item {
+QTableWidget::item, QTreeWidget::item {
     padding: 6px 4px;
     border-bottom: 1px solid #1A1C29;
 }
 
-QTreeWidget::item:selected, QListWidget::item:selected {
+QTableWidget::item:selected, QTreeWidget::item:selected, QListWidget::item:selected {
     background-color: #6C5CE7;
     color: #FFFFFF;
 }
@@ -425,7 +272,6 @@ QToolTip {
     padding: 6px;
 }
 """
-
 
 class AppMode(str, Enum):
     PORTABLE = "portable"
@@ -502,7 +348,7 @@ def run_uninstall_flow(install_dir: pathlib.Path, is_portable: bool):
     msg_box.setWindowTitle("Uninstall SyncDrive Studio")
     msg_box.setText("Are you sure you want to completely remove SyncDrive Studio?")
     msg_box.setInformativeText(
-        "This will delete all saved job configurations, activity logs, "
+        "This will delete SyncDrive Studio's saved settings and activity log, "
         + ("and the desktop/Start Menu shortcuts." if is_portable else
            "shortcuts, and the installed program folder.")
     )
@@ -547,7 +393,7 @@ def run_uninstall_flow(install_dir: pathlib.Path, is_portable: bool):
     else:
         QMessageBox.information(
             None, "Uninstall Complete",
-            "SyncDrive Studio settings, shortcuts, and data have been removed."
+            "SyncDrive Studio settings and shortcuts have been removed. Your Main and Backup folders were NOT touched."
             + ("" if is_portable else
                "\n\nThe program folder will finish removing itself in a few seconds "
                "after this window closes (it can't delete itself while running).")
@@ -607,1288 +453,604 @@ def acquire_single_instance_or_notify_running():
     return server
 
 
+
+
+def resource_path(name: str) -> pathlib.Path:
+    base = pathlib.Path(getattr(sys, "_MEIPASS", pathlib.Path(__file__).parent))
+    return base / name
+
+
+def fmt_size(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024
+
+
+def fmt_time(t) -> str:
+    return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+
+
+HOW_IT_WORKS = (
+    "HOW IT WORKS\n\n"
+    "• Main is your original folder. Backup is the copy.\n"
+    "• Files only travel Main ➜ Backup. Main is never changed unless YOU choose it for one file.\n"
+    "• New file in Main  ➜ copied to Backup.\n"
+    "• Changed file in Main ➜ the new version is copied; the old Backup version is kept in\n"
+    "  Backup/.backup_versions/<date>.\n"
+    "• File only in Backup ➜ you choose: leave it, move it to Backup/.backup_trash, or copy it to Main.\n"
+    "• If a file differs and the Backup copy is newer (or the same date), you choose which to keep.\n"
+    "• Nothing is ever erased automatically. You empty versions/trash yourself.\n"
+    "• Files are compared by size and date first, then by content (SHA-256) when needed."
+)
+
+DISCLAIMER = (
+    "DISCLAIMER OF LIABILITY:\n\n"
+    "SyncDrive Studio is free software provided 'AS-IS' with no warranty. The author is not liable for "
+    "data loss or damage. You use it at your own risk. Always keep an independent copy of important data."
+)
+
+
 class SetupWizardDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SyncDrive Studio - Setup Wizard")
-        self.setFixedSize(580, 500)
-        self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
-        
+        self.setWindowTitle("SyncDrive Studio — Setup")
+        self.setMinimumSize(640, 700)
+        self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET +
+                           "QGroupBox QLabel, QRadioButton, QCheckBox { color: #E6E8F5; } "
+                           "QGroupBox { color: #B9BCD8; }")
+
         self.selected_mode = AppMode.PORTABLE
         self.custom_install_path = str(pathlib.Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "SyncDrive Studio")
+        self.main_path = ""
+        self.backup_path = ""
 
         layout = QVBoxLayout(self)
-        title = QLabel("Welcome to SyncDrive Studio Setup")
+        title = QLabel("Welcome to SyncDrive Studio")
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #6C5CE7;")
         layout.addWidget(title)
 
-        disc_group = QGroupBox("⚠️ License & Legal Disclaimer")
-        disc_box = QVBoxLayout(disc_group)
-        disc_text = QTextEdit()
-        disc_text.setReadOnly(True)
-        disc_text.setText(
-            "DISCLAIMER OF LIABILITY:\n\n"
-            "SyncDrive Studio is free utility software provided 'AS-IS' for personal use.\n"
-            "The author holds no liability for data loss or hardware issues.\n"
-            "By checking accept, you use this application at your own risk."
-        )
-        disc_text.setMaximumHeight(100)
-        disc_box.addWidget(disc_text)
+        how = QTextEdit(); how.setReadOnly(True); how.setPlainText(HOW_IT_WORKS)
+        how.setMinimumHeight(190)
+        layout.addWidget(how)
 
-        self.accept_cb = QCheckBox("I accept the disclaimer terms")
-        self.accept_cb.stateChanged.connect(self.toggle_next_button)
-        disc_box.addWidget(self.accept_cb)
-        layout.addWidget(disc_group)
+        folders = QGroupBox("1 · Your folders (you can also set these later)")
+        fl = QVBoxLayout(folders)
+        self.main_edit = QLineEdit(); self.main_edit.setPlaceholderText("Main folder — your original files")
+        self.backup_edit = QLineEdit(); self.backup_edit.setPlaceholderText("Backup folder — where copies go")
+        for label, edit in (("Main:", self.main_edit), ("Backup:", self.backup_edit)):
+            row = QHBoxLayout()
+            lab = QLabel(label); lab.setFixedWidth(55)
+            btn = QPushButton("Browse..."); btn.setObjectName("RibbonBtn")
+            btn.clicked.connect(lambda _=False, e=edit: self._browse(e))
+            row.addWidget(lab); row.addWidget(edit); row.addWidget(btn)
+            fl.addLayout(row)
+        layout.addWidget(folders)
 
-        mode_group = QGroupBox("Deployment Mode")
+        mode_group = QGroupBox("2 · How to run")
         mode_box = QVBoxLayout(mode_group)
-        self.radio_portable = QRadioButton("📁 Portable Mode (No system installation)")
+        self.radio_portable = QRadioButton("📁 Portable (no installation, settings stay next to the program)")
         self.radio_portable.setChecked(True)
-        self.radio_portable.toggled.connect(self.toggle_location_box)
-
-        self.radio_install = QRadioButton("💻 System Install Mode (Copy to Program Files & create shortcuts)")
+        self.radio_portable.toggled.connect(lambda: self.dir_group.setEnabled(self.radio_install.isChecked()))
+        self.radio_install = QRadioButton("💻 Install (copy to Program Files, add shortcuts and an Uninstall entry)")
         mode_box.addWidget(self.radio_portable)
         mode_box.addWidget(self.radio_install)
         layout.addWidget(mode_group)
 
-        self.dir_group = QGroupBox("Installation Path")
+        self.dir_group = QGroupBox("Install location")
         dir_box = QHBoxLayout(self.dir_group)
         self.path_input = QLineEdit(self.custom_install_path)
-        browse_btn = QPushButton("Browse...")
+        browse_btn = QPushButton("Browse..."); browse_btn.setObjectName("RibbonBtn")
         browse_btn.clicked.connect(self.browse_install_dir)
-        dir_box.addWidget(self.path_input)
-        dir_box.addWidget(browse_btn)
+        dir_box.addWidget(self.path_input); dir_box.addWidget(browse_btn)
         self.dir_group.setEnabled(False)
         layout.addWidget(self.dir_group)
 
-        self.prog_group = QGroupBox("Progress")
-        prog_box = QVBoxLayout(self.prog_group)
-        self.install_progress = QProgressBar()
-        self.install_progress.setValue(0)
-        self.status_lbl = QLabel("Status: Waiting for confirmation...")
-        prog_box.addWidget(self.install_progress)
-        prog_box.addWidget(self.status_lbl)
-        layout.addWidget(self.prog_group)
+        disc = QTextEdit(); disc.setReadOnly(True); disc.setPlainText(DISCLAIMER); disc.setMaximumHeight(90)
+        layout.addWidget(disc)
+        self.accept_cb = QCheckBox("I understand and accept the disclaimer")
+        self.accept_cb.stateChanged.connect(lambda: self.confirm_btn.setEnabled(self.accept_cb.isChecked()))
+        layout.addWidget(self.accept_cb)
 
-        self.confirm_btn = QPushButton("Install & Launch")
+        self.confirm_btn = QPushButton("Start")
         self.confirm_btn.setObjectName("RibbonBtnPrimary")
         self.confirm_btn.setEnabled(False)
-        self.confirm_btn.clicked.connect(self.start_installation)
+        self.confirm_btn.clicked.connect(self.finish)
         layout.addWidget(self.confirm_btn)
 
-    def toggle_next_button(self):
-        self.confirm_btn.setEnabled(self.accept_cb.isChecked())
-
-    def toggle_location_box(self):
-        self.dir_group.setEnabled(self.radio_install.isChecked())
+    def _browse(self, edit: QLineEdit):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder", edit.text() or "")
+        if folder:
+            edit.setText(folder)
 
     def browse_install_dir(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Target Folder")
+        folder = QFileDialog.getExistingDirectory(self, "Select install location")
         if folder:
-            self.custom_install_path = str(pathlib.Path(folder) / "SyncDrive Studio")
-            self.path_input.setText(self.custom_install_path)
+            self.path_input.setText(str(pathlib.Path(folder) / "SyncDrive Studio"))
 
-    def start_installation(self):
+    def finish(self):
+        err = ""
+        m, b = self.main_edit.text().strip(), self.backup_edit.text().strip()
+        if m and b:
+            err = eng.check_roots(pathlib.Path(m), pathlib.Path(b))
+        if err:
+            QMessageBox.warning(self, "Check your folders", err)
+            return
+        self.main_path, self.backup_path = m, b
         self.selected_mode = AppMode.INSTALLED if self.radio_install.isChecked() else AppMode.PORTABLE
         self.custom_install_path = self.path_input.text().strip()
-        self.confirm_btn.setEnabled(False)
-
-        for i in range(1, 101):
-            time.sleep(0.015)
-            self.install_progress.setValue(i)
-            if i == 30: self.status_lbl.setText("Status: Preparing target location...")
-            elif i == 70: self.status_lbl.setText("Status: Extracting binaries...")
-            QApplication.processEvents()
-
-        self.status_lbl.setText("Status: Installation Complete!")
-        time.sleep(0.3)
         self.accept()
 
 
-class DependencyInstallDialog(QDialog):
-    """Shown at startup when a required package (e.g. watchdog) couldn't be
-    auto-installed silently — GUI apps launched without a console never show
-    the print()-based install progress from auto_install_dependencies(), so
-    that install could be failing (no network, no permissions, etc.) with the
-    user never seeing why. This makes the attempt, its result, and a manual
-    fallback command all visible."""
+class AnalyzeWorker(QThread):
+    status = pyqtSignal(str)
+    done = pyqtSignal(object)
 
-    def __init__(self, missing_packages: List[str], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("SyncDrive Studio - Missing Components")
-        self.setFixedSize(500, 380)
-        self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
-        self.missing_packages = list(missing_packages)
-        self.still_missing = list(missing_packages)
-
-        layout = QVBoxLayout(self)
-
-        title = QLabel("Some components aren't installed yet")
-        title.setStyleSheet("font-size: 15px; font-weight: 800; color: #6C5CE7;")
-        layout.addWidget(title)
-
-        info = QLabel(
-            "SyncDrive Studio needs these Python packages for full functionality "
-            "(e.g. real-time file-change watching):\n\n• " + "\n• ".join(self.missing_packages)
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setFixedHeight(150)
-        layout.addWidget(self.log_box)
-
-        btn_row = QHBoxLayout()
-        self.install_btn = QPushButton("📦 Install Now")
-        self.install_btn.setObjectName("RibbonBtnPrimary")
-        self.install_btn.clicked.connect(self.run_install)
-        btn_row.addWidget(self.install_btn)
-
-        self.copy_btn = QPushButton("Copy Manual Command")
-        self.copy_btn.setObjectName("RibbonBtn")
-        self.copy_btn.clicked.connect(self.copy_manual_command)
-        btn_row.addWidget(self.copy_btn)
-
-        self.continue_btn = QPushButton("Continue Without")
-        self.continue_btn.setObjectName("RibbonBtn")
-        self.continue_btn.clicked.connect(self.accept)
-        btn_row.addWidget(self.continue_btn)
-
-        layout.addLayout(btn_row)
-
-    def copy_manual_command(self):
-        cmd = f'"{sys.executable}" -m pip install {" ".join(self.missing_packages)}'
-        QApplication.clipboard().setText(cmd)
-        self.log_box.append(f"📋 Copied to clipboard:\n{cmd}\n")
-
-    def run_install(self):
-        self.install_btn.setEnabled(False)
-        self.log_box.append("Installing... this may take a minute.\n")
-        QApplication.processEvents()
-
-        still_missing = []
-        for pkg in list(self.still_missing):
-            self.log_box.append(f"→ pip install {pkg}")
-            QApplication.processEvents()
-            try:
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", pkg],
-                    capture_output=True, text=True, timeout=180
-                )
-                if result.returncode == 0:
-                    self.log_box.append(f"   ✅ {pkg} installed successfully.\n")
-                else:
-                    still_missing.append(pkg)
-                    err = (result.stderr or result.stdout or "unknown error").strip()[-500:]
-                    self.log_box.append(f"   ❌ {pkg} failed:\n   {err}\n")
-            except Exception as e:
-                still_missing.append(pkg)
-                self.log_box.append(f"   ❌ {pkg} failed: {e}\n")
-            QApplication.processEvents()
-
-        self.still_missing = still_missing
-        if not still_missing:
-            self.log_box.append("🎉 All done. Real-time watching will now work.")
-            self.install_btn.setText("✅ Installed")
-        else:
-            self.log_box.append(
-                f"⚠️ Still missing: {', '.join(still_missing)}. "
-                "Retry, copy the manual command, or continue without these features."
-            )
-            self.install_btn.setEnabled(True)
-            self.install_btn.setText("🔁 Retry")
-
-
-class IntervalPicker(QWidget):
-    """A friendlier way to set 'sync every N minutes' than a bare spinbox:
-    one-click common presets, plus a custom spinbox for anything else."""
-    valueChanged = pyqtSignal(int)
-
-    PRESETS = [("5m", 5), ("15m", 15), ("30m", 30), ("1h", 60), ("6h", 360), ("24h", 1440)]
-
-    def __init__(self, parent=None, initial_minutes: int = 30):
-        super().__init__(parent)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
-
-        self._preset_buttons = []
-        for label, minutes in self.PRESETS:
-            btn = QPushButton(label)
-            btn.setObjectName("PresetBtn")
-            btn.setCheckable(True)
-            btn.setFixedHeight(24)
-            btn.clicked.connect(lambda _, m=minutes: self.set_minutes(m))
-            row.addWidget(btn)
-            self._preset_buttons.append((btn, minutes))
-
-        self.spin = QSpinBox()
-        self.spin.setRange(1, 1440)
-        self.spin.setSuffix(" min")
-        self.spin.setFixedHeight(24)
-        self.spin.valueChanged.connect(self._on_spin_changed)
-        row.addWidget(self.spin)
-
-        self.set_minutes(initial_minutes)
-
-    def _sync_preset_highlight(self, minutes: int):
-        for btn, m in self._preset_buttons:
-            btn.blockSignals(True)
-            btn.setChecked(m == minutes)
-            btn.blockSignals(False)
-
-    def _on_spin_changed(self, value: int):
-        self._sync_preset_highlight(value)
-        self.valueChanged.emit(value)
-
-    def set_minutes(self, minutes: int):
-        self.spin.blockSignals(True)
-        self.spin.setValue(minutes)
-        self.spin.blockSignals(False)
-        self._sync_preset_highlight(minutes)
-        self.valueChanged.emit(minutes)
-
-    def value(self) -> int:
-        return self.spin.value()
-
-
-class SyncWorker(QThread):
-    progress_update = pyqtSignal(int, str)
-    action_item_signal = pyqtSignal(dict)
-    error_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(list)
-    conflict_resolution_needed = pyqtSignal(object)
-    delete_confirmation_needed = pyqtSignal(object)
-
-    def __init__(self, engine: SyncEngine, job: SyncJob, dry_run: bool):
+    def __init__(self, main: str, backup: str):
         super().__init__()
-        self.engine = engine
-        self.job = job
-        self.dry_run = dry_run
-        self.stop_requested = False
+        self.main, self.backup = main, backup
+        self._stop = False
 
     def stop(self):
-        self.stop_requested = True
-
-    def _ask_main_thread(self, signal, payload: dict, default):
-        """Emit a request to the GUI thread and block until it answers."""
-        payload["event"] = threading.Event()
-        payload["result"] = default
-        signal.emit(payload)
-        payload["event"].wait()
-        return payload["result"]
-
-    def _resolve_conflicts_interactively(self, conflicts):
-        return self._ask_main_thread(self.conflict_resolution_needed, {"conflicts": conflicts}, {})
+        self._stop = True
 
     def run(self):
-        actions = []
         try:
-            resolver = None if self.dry_run else self._resolve_conflicts_interactively
-            actions = self.engine.plan_job(self.job, conflict_resolver=resolver)
-
-            for w in self.engine.last_warnings:
-                self.progress_update.emit(0, f"🛡️ SAFETY: {w}")
-
-            # SAFETY: deletes never run silently. The user must explicitly
-            # approve them (default = No), and approved deletes only MOVE the
-            # file into <folder>/.syncdrive_trash — nothing is ever erased.
-            deletes = [a for a in actions if a.action_type in ("DELETE_TARGET", "DELETE_SOURCE")]
-            allow_deletes = False
-            if deletes and not self.dry_run:
-                allow_deletes = bool(self._ask_main_thread(
-                    self.delete_confirmation_needed, {"deletes": deletes}, False))
-                if not allow_deletes:
-                    self.progress_update.emit(0, f"🛡️ {len(deletes)} delete(s) NOT approved — skipped. No files were removed.")
-
-            total = len(actions)
-            if total == 0:
-                self.progress_update.emit(100, "No pending file changes detected.")
-
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            for idx, action in enumerate(actions, 1):
-                if self.stop_requested:
-                    self.progress_update.emit(0, "🛑 Sync operation cancelled by user.")
-                    break
-
-                pct = int((idx / total) * 100) if total > 0 else 100
-                msg = f"[{action.action_type}] {action.target_path or action.source_path}"
-
-                self.action_item_signal.emit({
-                    "action_type": action.action_type,
-                    "source": action.source_path or "-",
-                    "target": action.target_path or "-",
-                    "reason": action.reason
-                })
-
-                if not self.dry_run:
-                    try:
-                        if action.action_type == "COPY_TO_TARGET":
-                            d = pathlib.Path(action.target_path)
-                            d.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(action.source_path, d)
-                        elif action.action_type == "COPY_TO_SOURCE":
-                            s_ = pathlib.Path(action.source_path)
-                            s_.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(action.target_path, s_)
-                        elif action.action_type in ("DELETE_TARGET", "DELETE_SOURCE"):
-                            if allow_deletes:
-                                victim = action.target_path if action.action_type == "DELETE_TARGET" else action.source_path
-                                moved = self.engine.quarantine_file(victim, self.job, stamp)
-                                msg += f" -> moved to trash: {moved}"
-                            else:
-                                msg = "[SKIPPED DELETE] " + (action.target_path or action.source_path)
-                    except Exception as file_err:
-                        self.progress_update.emit(pct, f"⚠️ Skipped {action.target_path or action.source_path}: {file_err}")
-
-                self.progress_update.emit(pct, msg)
-
-            if not self.dry_run:
-                self.engine.record_post_sync_state(self.job)
-        except Exception as e:
-            self.error_signal.emit(str(e))
-        finally:
-            self.finished_signal.emit(actions)
+            plan = eng.build_plan(self.main, self.backup, lambda: self._stop, self.status.emit)
+        except Exception as e:  # never leave the UI waiting
+            plan = eng.Plan(self.main, self.backup, error=f"Unexpected error while analyzing: {e}")
+        self.done.emit(plan)
 
 
-class ConflictResolutionDialog(QDialog):
-    """Asks the user how to handle every file that differs on both sides."""
-    CHOICES = [("Keep Source Version", "COPY_TO_TARGET"),
-               ("Keep Target Version", "COPY_TO_SOURCE"),
-               ("Skip This File", "SKIP")]
+class BackupWorker(QThread):
+    progress = pyqtSignal(int, str)
+    log = pyqtSignal(str)
+    done = pyqtSignal(dict)
 
-    def __init__(self, conflicts, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Conflicts — you decide")
-        self.resize(900, 500)
-        self.conflicts = conflicts
-        lay = QVBoxLayout(self)
-        lay.addWidget(QLabel(f"{len(conflicts)} file(s) differ on both sides. Choose what to keep (nothing is overwritten without your choice; default is Skip):"))
-        self.table = QTableWidget(len(conflicts), 4)
-        self.table.setHorizontalHeaderLabels(["File", "Source (size · modified)", "Target (size · modified)", "Decision"])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.combos = []
-        fmt = lambda sz, mt: f"{sz:,} B · {datetime.fromtimestamp(mt).strftime('%Y-%m-%d %H:%M')}"
-        for r, c in enumerate(conflicts):
-            self.table.setItem(r, 0, QTableWidgetItem(c["relpath"]))
-            self.table.setItem(r, 1, QTableWidgetItem(fmt(c["src_size"], c["src_mtime"])))
-            self.table.setItem(r, 2, QTableWidgetItem(fmt(c["dst_size"], c["dst_mtime"])))
-            cb = QComboBox()
-            for label, _ in self.CHOICES:
-                cb.addItem(label)
-            cb.setCurrentIndex(2)
-            self.table.setCellWidget(r, 3, cb)
-            self.combos.append(cb)
-        self.table.setColumnWidth(0, 330); self.table.setColumnWidth(1, 200); self.table.setColumnWidth(2, 200)
-        lay.addWidget(self.table)
-        bulk = QHBoxLayout()
-        for label, idx in (("All: Keep Source", 0), ("All: Keep Target", 1), ("All: Skip", 2)):
-            b = QPushButton(label)
-            b.clicked.connect(lambda _=False, i=idx: [cb.setCurrentIndex(i) for cb in self.combos])
-            bulk.addWidget(b)
-        bulk.addStretch()
-        ok = QPushButton("Apply Decisions"); ok.clicked.connect(self.accept)
-        skip = QPushButton("Skip All"); skip.clicked.connect(self.reject)
-        bulk.addWidget(skip); bulk.addWidget(ok)
-        lay.addLayout(bulk)
+    def __init__(self, ops: List[eng.Operation], main: str, backup: str, verify: bool):
+        super().__init__()
+        self.ops, self.main, self.backup, self.verify = ops, pathlib.Path(main), pathlib.Path(backup), verify
+        self._stop = False
 
-    def get_resolutions(self):
-        return {c["relpath"]: self.CHOICES[cb.currentIndex()][1] for c, cb in zip(self.conflicts, self.combos)}
+    def stop(self):
+        self._stop = True
 
-
-class DeleteConfirmationDialog(QDialog):
-    def __init__(self, deletes, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("⚠️ Confirm deletions")
-        self.resize(760, 460)
-        lay = QVBoxLayout(self)
-        lbl = QLabel(f"<b>{len(deletes)} file(s) will be removed from a folder.</b><br>"
-                     "They are NOT erased: each is moved to a <code>.syncdrive_trash</code> folder inside the same "
-                     "drive/folder so you can restore it. If this list looks wrong, press <b>Do NOT delete</b>.")
-        lbl.setWordWrap(True)
-        lay.addWidget(lbl)
-        lst = QListWidget()
-        for a in deletes:
-            lst.addItem(a.target_path if a.action_type == "DELETE_TARGET" else a.source_path)
-        lay.addWidget(lst)
-        row = QHBoxLayout(); row.addStretch()
-        no = QPushButton("Do NOT delete (recommended)"); no.setDefault(True); no.clicked.connect(self.reject)
-        yes = QPushButton("Move to trash"); yes.clicked.connect(self.accept)
-        row.addWidget(no); row.addWidget(yes)
-        lay.addLayout(row)
-
-
-class ModernJobDialog(QDialog):
-    def __init__(self, parent=None, job: SyncJob = None):
-        super().__init__(parent)
-        self.setWindowTitle("Configure Sync Task")
-        self.resize(600, 460)
-        self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
-        self.job = job
-
-        layout = QVBoxLayout(self)
-
-        top_group = QGroupBox("General Options")
-        top_layout = QFormLayout(top_group)
-
-        self.name_input = QLineEdit(job.name if job else "New Sync Task")
-        top_layout.addRow("Task Name:", self.name_input)
-
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems([m.value for m in SyncMode])
-        if job: self.mode_combo.setCurrentText(job.mode.value)
-        top_layout.addRow("Sync Mode:", self.mode_combo)
-
-        self.schedule_combo = QComboBox()
-        self.schedule_combo.addItems([s.value for s in ScheduleType])
-        if job: self.schedule_combo.setCurrentText(job.schedule_type.value)
-        self.schedule_combo.currentTextChanged.connect(self.toggle_trigger_options)
-        top_layout.addRow("Trigger Strategy:", self.schedule_combo)
-
-        self.interval_picker = IntervalPicker(initial_minutes=job.interval_minutes if job else 30)
-        top_layout.addRow("Repeat Interval:", self.interval_picker)
-
-        self.debounce_spin = QSpinBox()
-        self.debounce_spin.setRange(1, 60)
-        self.debounce_spin.setSuffix(" sec")
-        self.debounce_spin.setValue(job.debounce_seconds if job else 5)
-        self.debounce_spin.setToolTip(
-            "Only used for 'on_file_change'. After a file changes, the app waits this "
-            "long for things to settle before syncing, so a burst of edits triggers one "
-            "sync instead of many. Lower = reacts faster; higher = fewer, batched syncs."
-        )
-        top_layout.addRow("React After (file-change only):", self.debounce_spin)
-
-        layout.addWidget(top_group)
-
-        drive_section = QHBoxLayout()
-
-        src_group = QGroupBox("Left Side (Source)")
-        src_box = QVBoxLayout(src_group)
-        self.src_input = QLineEdit(", ".join(job.sources) if job else "")
-        src_browse = QPushButton("📁 Select Source")
-        src_browse.setObjectName("RibbonBtn")
-        src_browse.clicked.connect(self.browse_source)
-        src_box.addWidget(self.src_input)
-        src_box.addWidget(src_browse)
-        drive_section.addWidget(src_group)
-
-        dst_group = QGroupBox("Right Side (Target)")
-        dst_box = QVBoxLayout(dst_group)
-        self.dst_input = QLineEdit(", ".join(job.targets) if job else "")
-        dst_browse = QPushButton("💾 Select Target")
-        dst_browse.setObjectName("RibbonBtn")
-        dst_browse.clicked.connect(self.browse_target)
-        dst_box.addWidget(self.dst_input)
-        dst_box.addWidget(dst_browse)
-        drive_section.addWidget(dst_group)
-
-        layout.addLayout(drive_section)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.accepted.connect(self.validate_and_accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-
-        self.toggle_trigger_options(self.schedule_combo.currentText())
-
-    def toggle_trigger_options(self, selected_mode: str):
-        self.interval_picker.setEnabled(selected_mode == ScheduleType.INTERVAL.value)
-
-    def browse_source(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
-        if folder:
-            current = [s.strip().strip('"').strip("'") for s in self.src_input.text().split(",") if s.strip()]
-            current.append(folder)
-            self.src_input.setText(", ".join(current))
-
-    def browse_target(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Target Folder")
-        if folder:
-            current = [t.strip().strip('"').strip("'") for t in self.dst_input.text().split(",") if t.strip()]
-            current.append(folder)
-            self.dst_input.setText(", ".join(current))
-
-    def validate_and_accept(self):
-        sources = [s.strip().strip('"').strip("'") for s in self.src_input.text().split(",") if s.strip()]
-        targets = [t.strip().strip('"').strip("'") for t in self.dst_input.text().split(",") if t.strip()]
-
-        if not sources or not targets:
-            QMessageBox.warning(self, "Validation Error", "Please specify valid Source and Target folders.")
-            return
-
-        norm_sources = {os.path.abspath(os.path.normpath(s)) for s in sources}
-        norm_targets = {os.path.abspath(os.path.normpath(t)) for t in targets}
-        overlap = norm_sources & norm_targets
-        if overlap:
-            QMessageBox.warning(
-                self, "Validation Error",
-                f"Source and Target cannot be the same folder: {', '.join(overlap)}\n"
-                "This would make the sync engine race against itself."
-            )
-            return
-
-        self.accept()
-
-    def get_job(self) -> SyncJob:
-        sources = [s.strip().strip('"').strip("'") for s in self.src_input.text().split(",") if s.strip()]
-        targets = [t.strip().strip('"').strip("'") for t in self.dst_input.text().split(",") if t.strip()]
-        job_id = self.job.id if (self.job and self.job.id) else str(uuid.uuid4())
-
-        try:
-            return SyncJob(
-                id=job_id,
-                name=self.name_input.text().strip() or "Untitled Job",
-                sources=sources,
-                targets=targets,
-                mode=SyncMode(self.mode_combo.currentText()),
-                schedule_type=ScheduleType(self.schedule_combo.currentText()),
-                interval_minutes=self.interval_picker.value(),
-                debounce_seconds=self.debounce_spin.value()
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Configuration Error", f"Unable to save job:\n{e}")
-            return self.job
+    def run(self):
+        stamp = eng.stamp_now()
+        stats = {"ok": 0, "failed": 0, "total": len(self.ops), "stopped": False, "stamp": stamp}
+        total = max(1, len(self.ops))
+        for i, op in enumerate(self.ops, 1):
+            if self._stop:
+                stats["stopped"] = True
+                self.log.emit("🛑 Stopped by user. Already finished files are kept.")
+                break
+            try:
+                msg = eng.apply_operation(op, self.main, self.backup, stamp, self.verify)
+                stats["ok"] += 1
+                self.log.emit(msg)
+            except Exception as e:
+                stats["failed"] += 1
+                self.log.emit(f"⚠️ FAILED {op.item.rel}: {e}  (nothing was lost; continuing)")
+            self.progress.emit(int(i / total * 100), f"{i:,} / {len(self.ops):,}  ·  {op.item.rel}")
+        self.done.emit(stats)
 
 
 class MainWindow(QMainWindow):
+    CONFLICT_CHOICES = [("Skip for now", None),
+                        ("Keep Main version  (update Backup)", "keep_main"),
+                        ("Keep Backup version  (replace Main)", "keep_backup")]
+    BACKUP_ONLY_CHOICES = [("Leave alone", None),
+                           ("Move to Backup trash", "trash"),
+                           ("Copy to Main", "copy_to_main")]
+
     def __init__(self, app_mode: AppMode, config_dir: pathlib.Path, install_dir: pathlib.Path = None):
         super().__init__()
         self.app_mode = app_mode
         self.config_dir = config_dir
         self.install_dir = install_dir
-        self.force_quit = False
+        self.settings_file = config_dir / "settings.json"
+        self.log_file = config_dir / "backup.log"
+        self.plan = None
+        self.rows = []              # [(category, Item, QComboBox|None)]
+        self.analyzer = None
         self.worker = None
-        self.setWindowTitle(f"SyncDrive Studio [{self.app_mode.value.upper()}]")
-        self.resize(1150, 720)
+        self.single_instance_server = None
+        self._auto_analyze_after_backup = False
+
+        self.setWindowTitle("SyncDrive Studio — Main ➜ Backup")
+        icon = resource_path("app_icon.ico")
+        if icon.exists():
+            self.setWindowIcon(QIcon(str(icon)))
+        self.resize(1180, 820)
         self.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
+        self._build_ui()
+        self._load_settings()
 
-        self.engine = SyncEngine()
-        self.jobs = self.load_jobs_from_disk()
+    # ------------------------------------------------------------------ UI
+    def _folder_card(self, title: str, subtitle: str, edit: QLineEdit):
+        card = QFrame(); card.setObjectName("PathCard")
+        lay = QVBoxLayout(card)
+        head = QLabel(f"<b>{title}</b>  <span style='color:#8A8DA8'>{subtitle}</span>")
+        lay.addWidget(head)
+        row = QHBoxLayout()
+        edit.setPlaceholderText("Choose a folder or drive...")
+        btn = QPushButton("Browse..."); btn.setObjectName("RibbonBtn")
+        btn.clicked.connect(lambda: self._browse(edit))
+        row.addWidget(edit); row.addWidget(btn)
+        lay.addLayout(row)
+        return card
 
-        self.smart_watchers = []
-        self.pending_job_ids = set()  # jobs whose file-change trigger fired while busy
-        self.init_ui()
-        self.init_system_tray()
-        self.refresh_job_tree()
-        self.init_drive_watcher()
-        self.init_timers_and_smart_watchers()
+    def _build_ui(self):
+        central = QWidget(); self.setCentralWidget(central)
+        root = QVBoxLayout(central)
 
-    def init_ui(self):
-        main_widget = QWidget()
-        layout = QVBoxLayout(main_widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        self.main_edit = QLineEdit(); self.backup_edit = QLineEdit()
+        root.addWidget(self._folder_card("MAIN", "your original files — only read, never changed by backup", self.main_edit))
+        arrow = QLabel("⬇  copies new and changed files  ⬇"); arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        arrow.setStyleSheet("color:#6C5CE7; font-weight:bold;")
+        root.addWidget(arrow)
+        root.addWidget(self._folder_card("BACKUP", "receives the copies; old versions and trash are kept here", self.backup_edit))
 
-        # 1. Slim top toolbar — run actions + trigger controls only.
-        #    (Create/Edit/Delete/Pause moved to the left sidebar, see below.)
-        toolbar = QFrame()
-        toolbar.setObjectName("ToolbarFrame")
-        tb_layout = QHBoxLayout(toolbar)
-        tb_layout.setContentsMargins(8, 4, 8, 4)
-
-        self.btn_analyze = QPushButton("🔍 Analyze (Preview)")
-        self.btn_analyze.setObjectName("RibbonBtnPrimary")
-        self.btn_analyze.clicked.connect(lambda: self.run_job(force_dry_run=True))
-        tb_layout.addWidget(self.btn_analyze)
-
-        self.btn_sync = QPushButton("🔄 Sync Now")
-        self.btn_sync.setObjectName("RibbonBtnPrimary")
-        self.btn_sync.setStyleSheet("background-color: #00B894;")
-        self.btn_sync.clicked.connect(lambda: self.run_job(force_dry_run=False))
-        tb_layout.addWidget(self.btn_sync)
-
-        self.btn_stop = QPushButton("🛑 Stop")
-        self.btn_stop.setObjectName("StopBtn")
+        bar = QHBoxLayout()
+        self.btn_analyze = QPushButton("🔍 Analyze"); self.btn_analyze.setObjectName("RibbonBtnPrimary")
+        self.btn_analyze.clicked.connect(self.analyze)
+        self.btn_start = QPushButton("▶ Start Backup"); self.btn_start.setObjectName("RibbonBtnPrimary")
+        self.btn_start.setEnabled(False)
+        self.btn_start.clicked.connect(self.start_backup)
+        self.btn_stop = QPushButton("⏹ Stop"); self.btn_stop.setObjectName("StopBtn")
         self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.stop_current_job)
-        tb_layout.addWidget(self.btn_stop)
+        self.btn_stop.clicked.connect(self.stop_all)
+        self.verify_cb = QCheckBox("Verify every copy (slower, safest)")
+        self.verify_cb.setChecked(True)
+        bar.addWidget(self.btn_analyze); bar.addWidget(self.btn_start); bar.addWidget(self.btn_stop)
+        bar.addSpacing(12); bar.addWidget(self.verify_cb); bar.addStretch()
+        for text, slot in (("📂 Old versions", lambda: self.open_store(eng.VERSIONS_DIR)),
+                           ("📂 Trash", lambda: self.open_store(eng.TRASH_DIR)),
+                           ("🧹 Empty versions…", lambda: self.empty_store(eng.VERSIONS_DIR)),
+                           ("🧹 Empty trash…", lambda: self.empty_store(eng.TRASH_DIR))):
+            b = QPushButton(text); b.setObjectName("RibbonBtn"); b.clicked.connect(slot); bar.addWidget(b)
+        root.addLayout(bar)
 
-        tb_layout.addSpacing(15)
+        self.summary_lbl = QLabel("Choose Main and Backup, then press Analyze. Nothing is changed by Analyze.")
+        self.summary_lbl.setWordWrap(True)
+        root.addWidget(self.summary_lbl)
 
-        # Fast Schedule Selector Bar
-        tb_layout.addWidget(QLabel("Trigger:"))
-        self.quick_schedule_combo = QComboBox()
-        self.quick_schedule_combo.addItems([s.value for s in ScheduleType])
-        self.quick_schedule_combo.currentTextChanged.connect(self.on_quick_schedule_changed)
-        tb_layout.addWidget(self.quick_schedule_combo)
+        bulk = QHBoxLayout()
+        bulk.addWidget(QLabel("Conflicts:"))
+        for text, idx in (("All: Keep Main", 1), ("All: Keep Backup", 2), ("All: Skip", 0)):
+            b = QPushButton(text); b.setObjectName("RibbonBtn")
+            b.clicked.connect(lambda _=False, i=idx: self._bulk("conflict", i)); bulk.addWidget(b)
+        bulk.addSpacing(20)
+        bulk.addWidget(QLabel("Only on Backup:"))
+        for text, idx in (("All: Leave alone", 0), ("All: Move to trash", 1), ("All: Copy to Main", 2)):
+            b = QPushButton(text); b.setObjectName("RibbonBtn")
+            b.clicked.connect(lambda _=False, i=idx: self._bulk("backup_only", i)); bulk.addWidget(b)
+        bulk.addStretch()
+        root.addLayout(bulk)
 
-        self.quick_interval_picker = IntervalPicker()
-        self.quick_interval_picker.valueChanged.connect(self.on_quick_interval_changed)
-        tb_layout.addWidget(self.quick_interval_picker)
+        split = QSplitter(Qt.Orientation.Vertical)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["What will happen", "File", "Main", "Backup", "Your decision"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for c in (2, 3, 4):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 230); self.table.setColumnWidth(2, 250)
+        self.table.setColumnWidth(3, 250); self.table.setColumnWidth(4, 270)
+        split.addWidget(self.table)
 
-        self.dry_run_cb = QCheckBox("Dry-Run")
-        self.dry_run_cb.setToolTip("Scans drive differences without performing file changes.")
-        tb_layout.addWidget(self.dry_run_cb)
+        self.log_view = QPlainTextEdit(); self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(20000)
+        split.addWidget(self.log_view)
+        split.setSizes([480, 180])
+        root.addWidget(split, 1)
 
-        tb_layout.addStretch()
+        prog = QHBoxLayout()
+        self.progress_bar = QProgressBar(); self.progress_bar.setValue(0)
+        self.status_lbl = QLabel("Ready")
+        prog.addWidget(self.progress_bar, 2); prog.addWidget(self.status_lbl, 3)
+        root.addLayout(prog)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(160)
-        self.progress_bar.setFixedHeight(18)
-        tb_layout.addWidget(self.progress_bar)
+    # ------------------------------------------------------------ settings/log
+    def _load_settings(self):
+        try:
+            data = json.loads(self.settings_file.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        self.main_edit.setText(data.get("main", ""))
+        self.backup_edit.setText(data.get("backup", ""))
+        self.verify_cb.setChecked(bool(data.get("verify", True)))
 
-        layout.addWidget(toolbar)
+    def _save_settings(self):
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            self.settings_file.write_text(json.dumps({
+                "main": self.main_edit.text().strip(),
+                "backup": self.backup_edit.text().strip(),
+                "verify": self.verify_cb.isChecked(),
+            }, indent=2), encoding="utf-8")
+        except Exception as e:
+            self.log(f"⚠️ Could not save settings: {e}")
 
-        # 2. Source <-> Target <-> Last-synced strip — high-contrast, always legible
-        conn_frame = QFrame()
-        conn_frame.setObjectName("ConnectionHeader")
-        conn_frame.setMinimumHeight(46)
-        conn_layout = QHBoxLayout(conn_frame)
-        conn_layout.setContentsMargins(10, 4, 10, 4)
+    def log(self, msg: str):
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        self.log_view.appendPlainText(line)
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+        except Exception:
+            pass
 
-        path_pill_style = (
-            "background-color: #171826; border: 1px solid #3A3C56; border-radius: 8px;"
-            " padding: 6px 12px; font-size: 13px; font-weight: 700;"
-        )
+    def _browse(self, edit: QLineEdit):
+        folder = QFileDialog.getExistingDirectory(self, "Select folder", edit.text() or "")
+        if folder:
+            edit.setText(folder)
+            self._save_settings()
 
-        src_card = QFrame()
-        src_card.setObjectName("PathCard")
-        src_c_layout = QHBoxLayout(src_card)
-        src_c_layout.setContentsMargins(6, 2, 6, 2)
-        self.src_lbl = QLabel("📁 Source: (Select a job)")
-        self.src_lbl.setStyleSheet(f"{path_pill_style} color: #4FD1E3;")
-        src_c_layout.addWidget(self.src_lbl)
-        conn_layout.addWidget(src_card, 1)
+    # ------------------------------------------------------------- analyze
+    def _busy(self) -> bool:
+        return bool((self.analyzer and self.analyzer.isRunning()) or (self.worker and self.worker.isRunning()))
 
-        arrow_lbl = QLabel(" ↔ ")
-        arrow_lbl.setStyleSheet("font-size: 16px; font-weight: 900; color: #8778F0;")
-        conn_layout.addWidget(arrow_lbl, 0, Qt.AlignmentFlag.AlignCenter)
+    def _set_busy(self, busy: bool):
+        self.btn_analyze.setEnabled(not busy)
+        self.btn_start.setEnabled(False if busy else bool(self.plan and self.plan.ok))
+        self.btn_stop.setEnabled(busy)
+        self.main_edit.setEnabled(not busy); self.backup_edit.setEnabled(not busy)
 
-        dst_card = QFrame()
-        dst_card.setObjectName("PathCard")
-        dst_c_layout = QHBoxLayout(dst_card)
-        dst_c_layout.setContentsMargins(6, 2, 6, 2)
-        self.dst_lbl = QLabel("💾 Target: (Select a job)")
-        self.dst_lbl.setStyleSheet(f"{path_pill_style} color: #34E7A0;")
-        dst_c_layout.addWidget(self.dst_lbl)
-        conn_layout.addWidget(dst_card, 1)
+    def analyze(self):
+        if self._busy():
+            return
+        m, b = self.main_edit.text().strip(), self.backup_edit.text().strip()
+        err = eng.check_roots(pathlib.Path(m), pathlib.Path(b))
+        if err:
+            QMessageBox.warning(self, "Check your folders", err)
+            return
+        self._save_settings()
+        self.plan = None
+        self.table.setRowCount(0); self.rows = []
+        self.progress_bar.setRange(0, 0)
+        self.status_lbl.setText("🔍 Scanning...")
+        self.log(f"--- Analyze: Main={m}  Backup={b} ---")
+        self._set_busy(True)
+        self.analyzer = AnalyzeWorker(m, b)
+        self.analyzer.status.connect(self.status_lbl.setText)
+        self.analyzer.done.connect(self.on_plan)
+        self.analyzer.start()
 
-        last_run_card = QFrame()
-        last_run_card.setObjectName("PathCard")
-        last_run_c_layout = QHBoxLayout(last_run_card)
-        last_run_c_layout.setContentsMargins(6, 2, 6, 2)
-        self.last_run_lbl = QLabel("🕓 Last synced: —")
-        self.last_run_lbl.setStyleSheet(f"{path_pill_style} color: #E6E8F5;")
-        last_run_c_layout.addWidget(self.last_run_lbl)
-        conn_layout.addWidget(last_run_card, 1)
+    def on_plan(self, plan):
+        self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
+        self.plan = plan
+        if not plan.ok:
+            self.status_lbl.setText("Stopped")
+            self.summary_lbl.setText(f"⛔ {plan.error}")
+            self.log(f"⛔ {plan.error}")
+            self._set_busy(False)
+            if plan.error != "Cancelled.":
+                QMessageBox.warning(self, "Nothing was changed", plan.error)
+            return
+        for w in plan.warnings:
+            self.log(f"⚠️ {w}")
+        self._fill_table(plan)
+        n_auto = len(plan.new) + len(plan.updates)
+        self.summary_lbl.setText(
+            f"<b>{len(plan.new):,}</b> new  ·  <b>{len(plan.updates):,}</b> updated  ·  "
+            f"<b style='color:#FDCB6E'>{len(plan.conflicts):,}</b> conflicts (you decide)  ·  "
+            f"<b style='color:#FDCB6E'>{len(plan.backup_only):,}</b> only on Backup (you decide)  ·  "
+            f"{plan.identical:,} identical" + (f" ({plan.hashed:,} confirmed by content)" if plan.hashed else ""))
+        self.status_lbl.setText("Analysis done — review, then Start Backup")
+        self.log(f"Analysis: {len(plan.new)} new, {len(plan.updates)} updated, {len(plan.conflicts)} conflicts, "
+                 f"{len(plan.backup_only)} only on Backup, {plan.identical} identical.")
+        self._set_busy(False)
+        if n_auto == 0 and not plan.conflicts and not plan.backup_only:
+            self.table_message("Everything is already backed up. ✅")
 
-        layout.addWidget(conn_frame)
+    def table_message(self, text: str):
+        self.table.setRowCount(1)
+        it = QTableWidgetItem(text); it.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.table.setItem(0, 0, it); self.table.setSpan(0, 0, 1, 5)
 
-        # 3. Dashboard stat cards — quick at-a-glance overview
-        stats_frame = QFrame()
-        stats_layout = QHBoxLayout(stats_frame)
-        stats_layout.setContentsMargins(14, 10, 14, 6)
-        stats_layout.setSpacing(10)
+    def _cell(self, text, color=None, tip=None):
+        it = QTableWidgetItem(text)
+        if color:
+            it.setForeground(QColor(color))
+        if tip:
+            it.setToolTip(tip)
+        return it
 
-        def make_stat_card(caption: str):
-            card = QFrame()
-            card.setObjectName("StatCard")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(4, 2, 4, 2)
-            card_layout.setSpacing(0)
-            value_lbl = QLabel("0")
-            value_lbl.setObjectName("StatValueLbl")
-            caption_lbl = QLabel(caption)
-            caption_lbl.setObjectName("StatCaptionLbl")
-            card_layout.addWidget(value_lbl)
-            card_layout.addWidget(caption_lbl)
-            stats_layout.addWidget(card, 1)
-            return value_lbl
+    def _side_text(self, size, mtime, tag=""):
+        return f"{fmt_time(mtime)} · {fmt_size(size)}" + (f"  — {tag}" if tag else "")
 
-        self.stat_total_jobs_lbl = make_stat_card("Total Tasks")
-        self.stat_active_watchers_lbl = make_stat_card("Live Watchers")
-        self.stat_paused_lbl = make_stat_card("Paused Tasks")
-        stats_layout.addStretch()
-        layout.addWidget(stats_frame)
+    def _fill_table(self, plan):
+        self.table.clearSpans()
+        total = len(plan.conflicts) + len(plan.backup_only) + len(plan.updates) + len(plan.new)
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(total)
+        self.rows = []
+        GREEN, AMBER, RED, MUTED = "#00B894", "#FDCB6E", "#E17055", "#8A8DA8"
+        r = 0
 
-        # 4. Three-pane workspace: sidebar (create/tools/activity) | tasks | detail
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        def add(category, item, what, what_color, main_txt, main_col, back_txt, back_col, combo_choices=None):
+            nonlocal r
+            self.table.setItem(r, 0, self._cell(what, what_color))
+            self.table.setItem(r, 1, self._cell(item.rel, None, item.rel + (f"\n{item.note}" if item.note else "")))
+            self.table.setItem(r, 2, self._cell(main_txt, main_col, os.path.join(plan.main, item.rel)))
+            self.table.setItem(r, 3, self._cell(back_txt, back_col, os.path.join(plan.backup, item.rel)))
+            combo = None
+            if combo_choices:
+                combo = QComboBox()
+                for label, _ in combo_choices:
+                    combo.addItem(label)
+                combo.setMinimumHeight(28)
+                self.table.setCellWidget(r, 4, combo)
+            else:
+                self.table.setItem(r, 4, self._cell("automatic", MUTED))
+            self.rows.append((category, item, combo))
+            r += 1
 
-        # --- LEFT: sidebar ---
-        sidebar = QWidget()
-        sidebar_box = QVBoxLayout(sidebar)
-        sidebar_box.setContentsMargins(8, 8, 8, 8)
-        sidebar_box.setSpacing(10)
+        def tags(mt, bt):
+            if abs(mt - bt) <= eng.MTIME_TOLERANCE:
+                return "same date", "same date", MUTED, MUTED
+            return (("NEWER", "older", GREEN, AMBER) if mt > bt else ("older", "NEWER", AMBER, GREEN))
 
-        btn_new = QPushButton("➕  Create New Job")
-        btn_new.setObjectName("RibbonBtnPrimary")
-        btn_new.setMinimumHeight(38)
-        btn_new.clicked.connect(self.add_job)
-        sidebar_box.addWidget(btn_new)
+        for it in plan.conflicts:
+            mt_tag, bt_tag, mc, bc = tags(it.main_mtime, it.backup_mtime)
+            add("conflict", it, f"⚠️ CONFLICT — {it.note.split(' · ')[0]}", AMBER,
+                self._side_text(it.main_size, it.main_mtime, mt_tag), mc,
+                self._side_text(it.backup_size, it.backup_mtime, bt_tag), bc, self.CONFLICT_CHOICES)
+        for it in plan.backup_only:
+            add("backup_only", it, "❓ Only on Backup", AMBER, "— not in Main —", RED,
+                self._side_text(it.backup_size, it.backup_mtime), None, self.BACKUP_ONLY_CHOICES)
+        for it in plan.updates:
+            mt_tag, bt_tag, mc, bc = tags(it.main_mtime, it.backup_mtime)
+            add("update", it, "🔄 Update Backup (old version kept)", GREEN,
+                self._side_text(it.main_size, it.main_mtime, mt_tag), mc,
+                self._side_text(it.backup_size, it.backup_mtime, bt_tag), bc)
+        for it in plan.new:
+            add("new", it, "➕ Copy to Backup (new)", GREEN,
+                self._side_text(it.main_size, it.main_mtime), None, "— not in Backup yet —", MUTED)
+        self.table.setUpdatesEnabled(True)
 
-        tools_group = QGroupBox("Tools")
-        tools_box = QVBoxLayout(tools_group)
-        tools_box.setSpacing(6)
+    def _bulk(self, category: str, index: int):
+        for cat, _item, combo in self.rows:
+            if cat == category and combo is not None:
+                combo.setCurrentIndex(index)
 
-        btn_edit = QPushButton("✏️  Edit Task")
-        btn_edit.setObjectName("RibbonBtn")
-        btn_edit.clicked.connect(self.edit_job)
-        tools_box.addWidget(btn_edit)
+    # -------------------------------------------------------------- backup
+    def _collect_operations(self):
+        ops = []
+        for cat, item, combo in self.rows:
+            if cat == "new":
+                ops.append(eng.Operation("new", item))
+            elif cat == "update":
+                ops.append(eng.Operation("update", item))
+            elif combo is not None:
+                choices = self.CONFLICT_CHOICES if cat == "conflict" else self.BACKUP_ONLY_CHOICES
+                kind = choices[combo.currentIndex()][1]
+                if kind:
+                    ops.append(eng.Operation(kind, item))
+        return ops
 
-        self.btn_toggle_active = QPushButton("⏸  Pause Task")
-        self.btn_toggle_active.setObjectName("RibbonBtn")
-        self.btn_toggle_active.clicked.connect(self.toggle_selected_job_active)
-        tools_box.addWidget(self.btn_toggle_active)
+    def start_backup(self):
+        if self._busy() or not self.plan or not self.plan.ok:
+            return
+        ops = self._collect_operations()
+        if not ops:
+            QMessageBox.information(self, "Nothing to do", "No files selected for any action.")
+            return
+        count = lambda k: sum(1 for o in ops if o.kind == k)
+        risky = []
+        if count("trash"):
+            risky.append(f"• {count('trash')} file(s) moved to Backup trash (recoverable)")
+        if count("keep_backup"):
+            risky.append(f"• {count('keep_backup')} file(s) in MAIN replaced by the Backup version (Main's old copy is saved first)")
+        if count("copy_to_main"):
+            risky.append(f"• {count('copy_to_main')} file(s) copied from Backup into MAIN")
+        text = (f"{count('new')} new, {count('update') + count('keep_main')} updated.\n")
+        if risky:
+            text += "\nThese actions go beyond a normal backup:\n" + "\n".join(risky) + "\n"
+        text += "\nNothing is erased. Continue?"
+        box = QMessageBox(self); box.setWindowTitle("Confirm backup"); box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        self._save_settings()
+        self.log(f"--- Backup started: {len(ops)} operation(s) ---")
+        self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
+        self._set_busy(True)
+        self.worker = BackupWorker(ops, self.plan.main, self.plan.backup, self.verify_cb.isChecked())
+        self.worker.progress.connect(lambda p, m: (self.progress_bar.setValue(p), self.status_lbl.setText(m)))
+        self.worker.log.connect(self.log)
+        self.worker.done.connect(self.on_backup_done)
+        self.worker.start()
 
-        btn_del = QPushButton("🗑️  Delete Task")
-        btn_del.setObjectName("RibbonBtn")
-        btn_del.clicked.connect(self.delete_job)
-        tools_box.addWidget(btn_del)
+    def on_backup_done(self, stats: dict):
+        self.log(f"--- Finished: {stats['ok']} done, {stats['failed']} failed"
+                 + (", stopped early" if stats["stopped"] else "") + " ---")
+        if stats["failed"]:
+            QMessageBox.warning(self, "Some files failed",
+                                f"{stats['failed']} file(s) could not be processed. Nothing was lost — see the log.")
+        self.progress_bar.setValue(100 if not stats["stopped"] else self.progress_bar.value())
+        self.status_lbl.setText("Done — re-checking...")
+        self._set_busy(False)
+        self.analyze()   # refresh: shows whatever was skipped or failed
 
-        sidebar_box.addWidget(tools_group)
+    def stop_all(self):
+        if self.analyzer and self.analyzer.isRunning():
+            self.analyzer.stop()
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+        self.status_lbl.setText("Stopping...")
 
-        activity_group = QGroupBox("Recent Activity")
-        activity_box = QVBoxLayout(activity_group)
-        self.recent_activity_list = QListWidget()
-        self.recent_activity_list.setStyleSheet("border: none; background: transparent;")
-        activity_box.addWidget(self.recent_activity_list)
-        sidebar_box.addWidget(activity_group, 1)
+    # --------------------------------------------------- versions / trash
+    def _store(self, name: str):
+        b = self.backup_edit.text().strip()
+        return pathlib.Path(b) / name if b else None
 
-        splitter.addWidget(sidebar)
+    def open_store(self, name: str):
+        p = self._store(name)
+        if not p or not p.is_dir():
+            QMessageBox.information(self, "Empty", "Nothing has been stored there yet.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
-        # --- CENTER: task list ---
-        center_widget = QWidget()
-        center_box = QVBoxLayout(center_widget)
-        center_box.setContentsMargins(4, 4, 4, 4)
+    def empty_store(self, name: str):
+        if self._busy():
+            return
+        p = self._store(name)
+        if not p or not p.is_dir():
+            QMessageBox.information(self, "Empty", "Nothing has been stored there yet.")
+            return
+        n, size = eng.folder_stats(p)
+        label = "old versions" if name == eng.VERSIONS_DIR else "trash"
+        box = QMessageBox(self); box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(f"Empty {label}")
+        box.setText(f"PERMANENTLY delete {n:,} file(s) ({fmt_size(size)}) from the Backup's {label} folder?\n\n"
+                    f"{p}\n\nThis cannot be undone. Open the folder first if you want to restore something.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            eng.empty_folder(p, pathlib.Path(self.backup_edit.text().strip()))
+            self.log(f"🧹 Emptied {label}: {n} file(s), {fmt_size(size)}")
+        except Exception as e:
+            QMessageBox.warning(self, "Could not empty", str(e))
 
-        self.watcher_status_lbl = QLabel("👁️ Live Auto-Sync: Idle")
-        self.watcher_status_lbl.setStyleSheet("color: #00B894; font-weight: bold; padding: 2px;")
-        center_box.addWidget(self.watcher_status_lbl)
-
-        self.job_tree = QTreeWidget()
-        self.job_tree.setHeaderLabel("All Sync Tasks")
-        self.job_tree.currentItemChanged.connect(self.on_job_tree_selected)
-        center_box.addWidget(self.job_tree)
-
-        splitter.addWidget(center_widget)
-
-        # --- RIGHT: diff comparison + log ---
-        right_container = QWidget()
-        rc_layout = QVBoxLayout(right_container)
-        rc_layout.setContentsMargins(4, 4, 4, 4)
-
-        self.diff_tree = QTreeWidget()
-        self.diff_tree.setHeaderLabels(["Source", "Action", "Target", "Details"])
-        self.diff_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.diff_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.diff_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.diff_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        self.diff_tree.setColumnWidth(3, 260)
-        # Filenames are the important part of each row and must never be
-        # truncated — full paths go in the tooltip instead of the visible
-        # cell, so there's no need to fight column width for the last
-        # segment of a long path.
-        self.diff_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        rc_layout.addWidget(self.diff_tree, 2)
-        self._diff_showing_placeholder = False
-        self.set_diff_empty_state("No file changes yet — click Analyze (Preview) or Sync Now to compare folders.")
-
-        self.diagnostics_lbl = QLabel("")
-        self.diagnostics_lbl.setWordWrap(True)
-        self.diagnostics_lbl.setStyleSheet("color: #E74C3C; font-weight: bold; padding: 2px;")
-        self.diagnostics_lbl.setVisible(False)
-        rc_layout.addWidget(self.diagnostics_lbl)
-
-        log_header = QLabel("Real-Time Change Log & Sync Activity")
-        log_header.setStyleSheet("color: #8E8EA8; font-weight: bold; margin-top: 4px;")
-        rc_layout.addWidget(log_header)
-
-        self.log_output = QTextEdit()
-        self.log_output.setFixedHeight(140)
-        self.log_output.setReadOnly(True)
-        rc_layout.addWidget(self.log_output, 1)
-
-        splitter.addWidget(right_container)
-        splitter.setSizes([220, 380, 550])
-
-        layout.addWidget(splitter, 1)
-        self.setCentralWidget(main_widget)
-
-    def init_system_tray(self):
-        """Configures System Tray for background watching when minimized or closed."""
-        self.tray_icon = QSystemTrayIcon(self)
-        
-        icon_path = (self.install_dir or self.config_dir) / "app_icon.ico"
-        if icon_path.exists():
-            self.tray_icon.setIcon(QIcon(str(icon_path)))
-            self.setWindowIcon(QIcon(str(icon_path)))
-        else:
-            self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon))
-
-        tray_menu = QMenu()
-        show_action = QAction("Open SyncDrive Studio", self)
-        show_action.triggered.connect(self.show_normal_and_raise)
-        
-        hide_action = QAction("Minimize to Tray", self)
-        hide_action.triggered.connect(self.hide)
-
-        quit_action = QAction("Exit Completely", self)
-        quit_action.triggered.connect(self.exit_app_completely)
-
-        uninstall_action = QAction("Uninstall SyncDrive Studio...", self)
-        uninstall_action.triggered.connect(self.launch_uninstaller)
-
-        tray_menu.addAction(show_action)
-        tray_menu.addAction(hide_action)
-        tray_menu.addSeparator()
-        tray_menu.addAction(uninstall_action)
-        tray_menu.addAction(quit_action)
-
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(self.on_tray_icon_activated)
-        self.tray_icon.show()
-
-    def launch_uninstaller(self):
-        is_portable = self.app_mode == AppMode.PORTABLE
-        install_dir = self.install_dir or self.config_dir
-        run_uninstall_flow(install_dir, is_portable)
-
+    # ------------------------------------------------------------- window
     def show_normal_and_raise(self):
         self.showNormal()
         self.activateWindow()
         self.raise_()
 
-    def on_tray_icon_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            if self.isVisible():
-                self.hide()
-            else:
-                self.show_normal_and_raise()
-
-    def changeEvent(self, event):
-        if event.type() == event.Type.WindowStateChange:
-            if self.windowState() & Qt.WindowState.WindowMinimized:
-                QTimer.singleShot(0, self.hide)
-                self.tray_icon.showMessage(
-                    "SyncDrive Studio",
-                    "Running in background. Double-click tray icon to restore.",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    2000
-                )
-        super().changeEvent(event)
-
-    def refresh_job_tree(self):
-        self.job_tree.clear()
-        backup_node = QTreeWidgetItem(self.job_tree, ["📁 One-Way Backup Tasks"])
-        mirror_node = QTreeWidgetItem(self.job_tree, ["🪞 Mirror Tasks"])
-        twoway_node = QTreeWidgetItem(self.job_tree, ["🔄 Bidirectional Tasks"])
-
-        for job in self.jobs:
-            status_icon = "⚡" if job.is_active else "⏸"
-            text = f"{status_icon} {job.name}"
-            if job.mode == SyncMode.ONE_WAY_BACKUP:
-                item = QTreeWidgetItem(backup_node, [text])
-            elif job.mode == SyncMode.ONE_WAY_MIRROR:
-                item = QTreeWidgetItem(mirror_node, [text])
-            else:
-                item = QTreeWidgetItem(twoway_node, [text])
-            item.setData(0, Qt.ItemDataRole.UserRole, job.id)
-            if not job.is_active:
-                item.setForeground(0, QColor("#5A5B72"))
-                item.setToolTip(0, "Paused — won't run on schedule or file changes")
-
-        self.job_tree.expandAll()
-        self.update_stat_cards()
-
-    def update_stat_cards(self):
-        total = len(self.jobs)
-        paused = sum(1 for j in self.jobs if not j.is_active)
-        active_watchers = getattr(self, "active_watchers_count", 0)
-        self.stat_total_jobs_lbl.setText(str(total))
-        self.stat_active_watchers_lbl.setText(str(active_watchers))
-        self.stat_paused_lbl.setText(str(paused))
-
-    JOBS_FILE_NAME = "jobs.json"
-
-    def load_jobs_from_disk(self) -> List[SyncJob]:
-        """Loads previously saved jobs. Called before init_ui(), so this can't
-        log to the UI yet — any load failure is silently treated as 'no saved
-        jobs' rather than crashing startup."""
-        jobs_path = self.config_dir / self.JOBS_FILE_NAME
-        if not jobs_path.exists():
-            return []
-        try:
-            raw = json.loads(jobs_path.read_text(encoding="utf-8"))
-            return [SyncJob(**item) for item in raw]
-        except Exception:
-            return []
-
-    def save_jobs_to_disk(self):
-        """Persists the current job list. Called after every job create/edit/
-        delete/pause/trigger-change and after each sync completes, so nothing
-        the user configured is lost on restart."""
-        jobs_path = self.config_dir / self.JOBS_FILE_NAME
-        try:
-            data = [json.loads(j.model_dump_json()) for j in self.jobs]
-            jobs_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception as e:
-            if hasattr(self, "log_output"):
-                self.log_output.append(f"⚠️ Failed to save job configuration: {e}")
-
-    def get_selected_job(self) -> SyncJob:
-        item = self.job_tree.currentItem()
-        if item and item.data(0, Qt.ItemDataRole.UserRole):
-            job_id = item.data(0, Qt.ItemDataRole.UserRole)
-            for j in self.jobs:
-                if j.id == job_id:
-                    return j
-        return self.jobs[0] if self.jobs else None
-
-    def on_job_tree_selected(self, current, previous):
-        job = self.get_selected_job()
-        if job:
-            src_str = ", ".join(job.sources) if job.sources else "None"
-            dst_str = ", ".join(job.targets) if job.targets else "None"
-            self.src_lbl.setText(f"📁 Source: {src_str}")
-            self.dst_lbl.setText(f"💾 Target: {dst_str}")
-
-            last_run_str = job.last_run_at if job.last_run_at else "never"
-            self.last_run_lbl.setText(f"🕓 Last synced: {last_run_str}")
-
-            self.btn_toggle_active.setText("▶ Resume Task" if not job.is_active else "⏸ Pause Task")
-
-            # Sync quick toolbar widgets without infinite loop
-            self.quick_schedule_combo.blockSignals(True)
-            self.quick_schedule_combo.setCurrentText(job.schedule_type.value)
-            self.quick_schedule_combo.blockSignals(False)
-            self.quick_interval_picker.blockSignals(True)
-            self.quick_interval_picker.set_minutes(job.interval_minutes)
-            self.quick_interval_picker.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
-            self.quick_interval_picker.blockSignals(False)
-
-            self.log_output.append(f"ℹ️ Selected task: '{job.name}' [{job.mode.value}]")
-
-    def toggle_selected_job_active(self):
-        job = self.get_selected_job()
-        if job:
-            job.is_active = not job.is_active
-            self.btn_toggle_active.setText("▶ Resume Task" if not job.is_active else "⏸ Pause Task")
-            state = "resumed" if job.is_active else "paused"
-            self.log_output.append(f"{'▶️' if job.is_active else '⏸️'} Task '{job.name}' {state}.")
-            self.refresh_job_tree()
-            self.init_timers_and_smart_watchers()
-            self.update_stat_cards()
-            self.save_jobs_to_disk()
-
-    def on_quick_schedule_changed(self, schedule_val: str):
-        job = self.get_selected_job()
-        if job:
-            job.schedule_type = ScheduleType(schedule_val)
-            self.quick_interval_picker.setEnabled(job.schedule_type == ScheduleType.INTERVAL)
-            self.init_timers_and_smart_watchers()
-            self.save_jobs_to_disk()
-
-    def on_quick_interval_changed(self, interval_val: int):
-        job = self.get_selected_job()
-        if job:
-            job.interval_minutes = interval_val
-            self.init_timers_and_smart_watchers()
-            self.save_jobs_to_disk()
-
-    def add_job(self):
-        dialog = ModernJobDialog(self)
-        if dialog.exec():
-            new_job = dialog.get_job()
-            if new_job:
-                self.jobs.append(new_job)
-                self.refresh_job_tree()
-                self.init_timers_and_smart_watchers()
-                self.save_jobs_to_disk()
-
-    def edit_job(self):
-        job = self.get_selected_job()
-        if job:
-            dialog = ModernJobDialog(self, job=job)
-            if dialog.exec():
-                updated_job = dialog.get_job()
-                if updated_job:
-                    idx = self.jobs.index(job)
-                    self.jobs[idx] = updated_job
-                    self.refresh_job_tree()
-                    self.init_timers_and_smart_watchers()
-                    self.save_jobs_to_disk()
-
-    def delete_job(self):
-        job = self.get_selected_job()
-        if job:
-            self.jobs.remove(job)
-            self.refresh_job_tree()
-            self.init_timers_and_smart_watchers()
-            self.save_jobs_to_disk()
-
-    def init_drive_watcher(self):
-        self.watcher = DriveWatcherThread()
-        self.watcher.drive_connected.connect(self.on_drive_plugged_in)
-        self.watcher.start()
-
-    def _create_change_callback(self, job: SyncJob):
-        def _callback(event_type: str, filename: str):
-            self.on_smart_change(job, event_type, filename)
-        return _callback
-
-    def init_timers_and_smart_watchers(self):
-        for w in self.smart_watchers:
-            w.stop()
-        self.smart_watchers.clear()
-
-        active_watchers_count = 0
-        watcher_warnings = []
-
-        for job in self.jobs:
-            if not job.is_active:
-                continue
-
-            if job.schedule_type == ScheduleType.INTERVAL:
-                timer = QTimer(self)
-                interval_ms = job.interval_minutes * 60 * 1000
-                timer.timeout.connect(lambda j=job: self.execute_job_instance(j, dry_run=False))
-                timer.start(interval_ms)
-                self.log_output.append(f"⏱️ Scheduled timer active: '{job.name}' ({job.interval_minutes}m)")
-
-            elif job.schedule_type == ScheduleType.ON_FILE_CHANGE:
-                if watchdog_observer_class() is None:
-                    watcher_warnings.append(f"'{job.name}': real-time watching unavailable — {_watchdog_last_error or 'watchdog import failed for an unknown reason'}.")
-                    continue
-
-                valid_paths = [os.path.abspath(os.path.normpath(p)) for p in job.sources if pathlib.Path(p).exists()]
-                missing_paths = [p for p in job.sources if not pathlib.Path(p).exists()]
-                if missing_paths:
-                    watcher_warnings.append(f"'{job.name}': source path(s) not found: {', '.join(missing_paths)}")
-
-                if valid_paths:
-                    callback_slot = self._create_change_callback(job)
-                    watcher = SmartFolderWatcherManager(valid_paths, callback=callback_slot, debounce_seconds=job.debounce_seconds)
-                    watcher.bridge.watcher_error.connect(lambda msg, j=job: self.on_watcher_error(j, msg))
-                    watcher.start()
-                    self.smart_watchers.append(watcher)
-                    if watcher.active:
-                        active_watchers_count += 1
-                        self.log_output.append(f"👁️ Real-time Watcher Active: '{job.name}' monitoring {len(valid_paths)} folder(s)")
-                    else:
-                        watcher_warnings.append(f"'{job.name}': watcher failed to start (see log).")
-
-        if watcher_warnings:
-            for w in watcher_warnings:
-                self.log_output.append(f"⚠️ Auto-Sync issue — {w}")
-        self.set_diagnostics(watcher_warnings)
-
-        if active_watchers_count > 0:
-            self.watcher_status_lbl.setText(f"👁️ Auto-Sync Active ({active_watchers_count} Task[s])")
-            self.watcher_status_lbl.setStyleSheet("color: #00B894; font-weight: bold;")
-        elif watcher_warnings:
-            self.watcher_status_lbl.setText(f"⚠️ Auto-Sync: {len(watcher_warnings)} issue(s) — see log")
-            self.watcher_status_lbl.setStyleSheet("color: #E74C3C; font-weight: bold;")
-        else:
-            self.watcher_status_lbl.setText("👁️ Auto-Sync: Idle")
-            self.watcher_status_lbl.setStyleSheet("color: #8E8EA8; font-weight: normal;")
-
-        self.active_watchers_count = active_watchers_count
-        self.update_stat_cards()
-
-    def on_watcher_error(self, job: SyncJob, message: str):
-        self.log_output.append(f"⚠️ Watcher error for '{job.name}': {message}")
-
-    def on_smart_change(self, job: SyncJob, event_type: str, filename: str):
-        if self.worker and self.worker.isRunning():
-            self.pending_job_ids.add(job.id)
-            self.log_output.append(f"🔔 Realtime Event: [{event_type}] '{filename}' in '{job.name}' -> sync busy, queued.")
-            return
-        self.log_output.append(f"🔔 Realtime Event: [{event_type}] '{filename}' in '{job.name}' -> Auto Syncing...")
-        self.execute_job_instance(job, dry_run=False)
-
-    def on_drive_plugged_in(self, mountpoint: str):
-        self.log_output.append(f"🔌 Drive Plugged In: {mountpoint}")
-        for job in self.jobs:
-            if job.schedule_type == ScheduleType.ON_DRIVE_CONNECT and job.is_active:
-                if any(mountpoint in t for t in job.targets):
-                    self.execute_job_instance(job, dry_run=False)
-
-    def stop_current_job(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
-            self.log_output.append("🛑 Stopping job execution...")
-
-    def run_job(self, force_dry_run: bool = False):
-        job = self.get_selected_job()
-        if job:
-            is_dry = force_dry_run or self.dry_run_cb.isChecked()
-            self.execute_job_instance(job, dry_run=is_dry)
-
-    def execute_job_instance(self, job: SyncJob, dry_run: bool):
-        if self.worker and self.worker.isRunning():
-            return  # Prevent overlapping runs
-
-        self.btn_analyze.setEnabled(False)
-        self.btn_sync.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        # plan_job() below runs synchronously and reports no progress while it
-        # walks the folders — that's usually the slowest part. An indeterminate
-        # (pulsing) bar during that phase means the bar isn't just frozen at 0%
-        # with no feedback; it switches to a real percentage once actions are
-        # known and being applied (see the progress_update handler below).
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setFormat("🔍 Scanning...")
-        self.diff_tree.clear()
-
-        mode_str = "ANALYZE PREVIEW" if dry_run else "LIVE SYNC"
-        self.log_output.append(f"\n--- Running '{job.name}' [{mode_str}] ---")
-
-        self.worker = SyncWorker(self.engine, job, dry_run)
-        self.worker.progress_update.connect(self._on_worker_progress)
-        self.worker.action_item_signal.connect(self.add_diff_tree_item)
-        self.worker.error_signal.connect(lambda err: QMessageBox.critical(self, "Error", err))
-        self.worker.finished_signal.connect(self.on_sync_finished)
-        self.worker.conflict_resolution_needed.connect(self.handle_conflict_resolution)
-        self.worker.delete_confirmation_needed.connect(self.handle_delete_confirmation)
-        self.worker.start()
-
-    def handle_conflict_resolution(self, pending):
-        try:
-            dlg = ConflictResolutionDialog(pending["conflicts"], self)
-            pending["result"] = dlg.get_resolutions() if dlg.exec() == QDialog.DialogCode.Accepted else {}
-        finally:
-            pending["event"].set()
-
-    def handle_delete_confirmation(self, pending):
-        try:
-            dlg = DeleteConfirmationDialog(pending["deletes"], self)
-            pending["result"] = dlg.exec() == QDialog.DialogCode.Accepted
-        finally:
-            pending["event"].set()
-
-    def _on_worker_progress(self, pct: int, msg: str):
-        if self.progress_bar.maximum() == 0:
-            # First real progress update means plan_job() has finished scanning
-            # and we now know how many actions there are — switch out of the
-            # pulsing scan indicator into an actual percentage.
-            self.progress_bar.setRange(0, 100)
-            self.progress_bar.setFormat("%p%")
-        self.progress_bar.setValue(pct)
-        self.log_output.append(msg)
-
-    def set_diff_empty_state(self, message: str):
-        self.diff_tree.clear()
-        placeholder = QTreeWidgetItem(self.diff_tree, [message, "", "", ""])
-        placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
-        font = placeholder.font(0)
-        font.setItalic(True)
-        placeholder.setFont(0, font)
-        placeholder.setForeground(0, QColor("#5A5B72"))
-        self._diff_showing_placeholder = True
-
-    def set_diagnostics(self, warnings: List[str]):
-        if warnings:
-            self.diagnostics_lbl.setText("⚠️ " + "  |  ".join(warnings))
-            self.diagnostics_lbl.setVisible(True)
-        else:
-            self.diagnostics_lbl.clear()
-            self.diagnostics_lbl.setVisible(False)
-
-    ACTION_DISPLAY = {
-        "COPY_TO_TARGET": ("➡️", "Copying to target"),
-        "COPY_TO_SOURCE": ("⬅️", "Copying to source"),
-        "DELETE_TARGET": ("🗑️", "Deleting from target"),
-        "DELETE_SOURCE": ("🗑️", "Deleting from source"),
-    }
-
-    def add_diff_tree_item(self, item_data: dict):
-        if self._diff_showing_placeholder:
-            self.diff_tree.clear()
-            self._diff_showing_placeholder = False
-
-        action_type = item_data["action_type"]
-        icon, label = self.ACTION_DISPLAY.get(action_type, ("•", action_type))
-
-        source_path = item_data["source"]
-        target_path = item_data["target"]
-        source_name = os.path.basename(source_path) if source_path != "-" else "—"
-        target_name = os.path.basename(target_path) if target_path != "-" else "—"
-
-        tree_item = QTreeWidgetItem(self.diff_tree, [
-            source_name,
-            f"{icon} {label}",
-            target_name,
-            item_data["reason"]
-        ])
-        # Full paths live in the tooltip — the visible cell always shows just
-        # the filename in full, never truncated, since that's the part that
-        # actually matters when scanning a long list of changes.
-        if source_path != "-":
-            tree_item.setToolTip(0, source_path)
-        if target_path != "-":
-            tree_item.setToolTip(2, target_path)
-
-        if action_type in ("DELETE_TARGET", "DELETE_SOURCE"):
-            tree_item.setForeground(1, QColor("#E74C3C"))
-        elif action_type in ("COPY_TO_TARGET", "COPY_TO_SOURCE"):
-            tree_item.setForeground(1, QColor("#00B894"))
-
-    def on_sync_finished(self, actions):
-        self.btn_analyze.setEnabled(True)
-        self.btn_sync.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        if self.progress_bar.maximum() == 0:
-            self.progress_bar.setRange(0, 100)
-            self.progress_bar.setFormat("%p%")
-        self.progress_bar.setValue(100)
-        self.log_output.append(f"✅ Sync Finished. Operations: {len(actions)}\n")
-        if not actions:
-            self.set_diff_empty_state("No differences found — source and target are already in sync.")
-
-        finished_job = self.worker.job if self.worker else None
-        if finished_job and not self.worker.dry_run:
-            finished_job.last_run_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.save_jobs_to_disk()
-            if self.get_selected_job() and self.get_selected_job().id == finished_job.id:
-                self.last_run_lbl.setText(f"🕓 Last synced: {finished_job.last_run_at}")
-
-        if finished_job:
-            icon = "✅" if actions or not self.worker.dry_run else "ℹ️"
-            time_str = datetime.now().strftime("%H:%M")
-            mode_tag = "Preview" if self.worker.dry_run else "Synced"
-            entry = QListWidgetItem(f"{icon} {finished_job.name} — {mode_tag} · {len(actions)} change(s) · {time_str}")
-            self.recent_activity_list.insertItem(0, entry)
-            while self.recent_activity_list.count() > 25:
-                self.recent_activity_list.takeItem(self.recent_activity_list.count() - 1)
-
-        if self.pending_job_ids:
-            next_job_id = self.pending_job_ids.pop()
-            next_job = next((j for j in self.jobs if j.id == next_job_id), None)
-            if next_job:
-                self.log_output.append(f"🔁 Running queued change for '{next_job.name}'...")
-                QTimer.singleShot(0, lambda j=next_job: self.execute_job_instance(j, dry_run=False))
-
-    def exit_app_completely(self):
-        self.force_quit = True
-        self.close()
-
     def closeEvent(self, event):
-        if not self.force_quit:
-            event.ignore()
-            self.hide()
-            self.tray_icon.showMessage(
-                "SyncDrive Studio Active",
-                "App minimized to System Tray. Background watchers remain active.",
-                QSystemTrayIcon.MessageIcon.Information,
-                2000
-            )
-        else:
-            self.watcher.stop()
-            for w in self.smart_watchers:
-                w.stop()
-            self.tray_icon.hide()
-            event.accept()
+        if self._busy():
+            r = QMessageBox.question(self, "Work in progress", "A backup/analysis is running. Stop it and quit?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.stop_all()
+            for t in (self.analyzer, self.worker):
+                if t and t.isRunning():
+                    t.wait(15000)
+        self._save_settings()
+        event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyleSheet(GOODSYNC_STUDIO_STYLESHEET)
 
     if "--uninstall" in sys.argv:
-        # Reached via the Start Menu "Uninstall SyncDrive Studio" shortcut, or
-        # via Windows Settings > Apps (registered in register_windows_uninstaller).
-        if getattr(sys, 'frozen', False):
+        if getattr(sys, "frozen", False):
             _exe_dir_for_uninstall = pathlib.Path(sys.executable).parent
         else:
             _exe_dir_for_uninstall = pathlib.Path(__file__).parent
@@ -1899,77 +1061,61 @@ if __name__ == "__main__":
 
     single_instance_server = acquire_single_instance_or_notify_running()
     if single_instance_server is None:
-        # Another instance responded and is being brought to the foreground.
         sys.exit(0)
 
-    if not getattr(sys, 'frozen', False):
-        still_missing = [pkg for pkg, imp in REQUIRED_PACKAGES.items() if importlib.util.find_spec(imp) is None]
-        if still_missing:
-            dep_dialog = DependencyInstallDialog(still_missing)
-            dep_dialog.exec()
-
-    if getattr(sys, 'frozen', False):
+    if getattr(sys, "frozen", False):
         exe_path = pathlib.Path(sys.executable)
-        exe_dir = exe_path.parent
     else:
         exe_path = pathlib.Path(__file__)
-        exe_dir = exe_path.parent
+    exe_dir = exe_path.parent
 
     mode_file = exe_dir / ".app_mode"
-    selected_mode = None
-    target_install_dir = None
-
-    is_installed_instance = mode_file.exists()
-
-    if is_installed_instance:
+    wizard_main = wizard_backup = ""
+    if mode_file.exists():
         selected_mode = AppMode.PORTABLE if mode_file.read_text().strip() == AppMode.PORTABLE.value else AppMode.INSTALLED
         target_install_dir = exe_dir
     else:
         wizard = SetupWizardDialog()
-        if wizard.exec() == QDialog.DialogCode.Accepted:
-            selected_mode = wizard.selected_mode
-            if selected_mode == AppMode.INSTALLED:
-                target_install_dir = pathlib.Path(wizard.custom_install_path)
-            else:
-                target_install_dir = exe_dir
-            try:
-                mode_file.write_text(selected_mode.value)
-            except Exception:
-                pass
-        else:
+        if wizard.exec() != QDialog.DialogCode.Accepted:
             sys.exit(0)
+        selected_mode = wizard.selected_mode
+        target_install_dir = pathlib.Path(wizard.custom_install_path) if selected_mode == AppMode.INSTALLED else exe_dir
+        wizard_main, wizard_backup = wizard.main_path, wizard.backup_path
+        try:
+            mode_file.write_text(selected_mode.value)
+        except Exception:
+            pass
 
     config_dir = exe_dir / ".config" if selected_mode == AppMode.PORTABLE else pathlib.Path.home() / ".syncdrive_studio"
     config_dir.mkdir(parents=True, exist_ok=True)
+    if wizard_main or wizard_backup:
+        try:
+            (config_dir / "settings.json").write_text(json.dumps(
+                {"main": wizard_main, "backup": wizard_backup, "verify": True}, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
-    if selected_mode == AppMode.INSTALLED and getattr(sys, 'frozen', False) and target_install_dir:
+    if selected_mode == AppMode.INSTALLED and getattr(sys, "frozen", False) and target_install_dir:
         try:
             target_install_dir.mkdir(parents=True, exist_ok=True)
             installed_exe = target_install_dir / "SyncDriveStudio.exe"
-
             if exe_path.resolve() != installed_exe.resolve():
                 shutil.copy2(exe_path, installed_exe)
                 try:
                     (target_install_dir / ".app_mode").write_text(AppMode.INSTALLED.value)
                 except Exception:
                     pass
-
-            desktop_shortcut = pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk"
-            start_menu_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "SyncDrive Studio.lnk"
-            uninstall_shortcut = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")) / "Uninstall SyncDrive Studio.lnk"
-            icon_file = exe_dir / "app_icon.ico"
-
-            create_windows_shortcut(installed_exe, desktop_shortcut, icon_file)
-            create_windows_shortcut(installed_exe, start_menu_shortcut, icon_file)
-            create_windows_shortcut(installed_exe, uninstall_shortcut, icon_file, arguments="--uninstall")
+            programs = pathlib.Path(os.path.expanduser("~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs"))
+            icon_file = resource_path("app_icon.ico")
+            create_windows_shortcut(installed_exe, pathlib.Path(os.path.expanduser("~/Desktop")) / "SyncDrive Studio.lnk", icon_file)
+            create_windows_shortcut(installed_exe, programs / "SyncDrive Studio.lnk", icon_file)
+            create_windows_shortcut(installed_exe, programs / "Uninstall SyncDrive Studio.lnk", icon_file, arguments="--uninstall")
             register_windows_uninstaller(target_install_dir, installed_exe, icon_file)
         except PermissionError:
             if sys.platform.startswith("win"):
-                QMessageBox.warning(
-                    None,
-                    "Administrator Required",
-                    f"Writing to '{target_install_dir}' requires Administrator rights.\nPlease right-click the setup file and select 'Run as Administrator'."
-                )
+                QMessageBox.warning(None, "Administrator Required",
+                                    f"Writing to '{target_install_dir}' requires Administrator rights.\n"
+                                    "Please right-click the program and select 'Run as Administrator'.")
                 sys.exit(1)
 
     window = MainWindow(app_mode=selected_mode, config_dir=config_dir, install_dir=target_install_dir)

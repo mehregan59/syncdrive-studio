@@ -1,51 +1,49 @@
 # SyncDrive Studio
 
-A free, open-source Windows desktop app for syncing files between two folders
-— built with Python and PyQt6. It supports one-way backup, mirroring, and
-two-way sync, with manual, scheduled, real-time, and drive-connect triggers.
+A free, open-source Windows app that **backs up one folder (Main) to another (Backup)** —
+built with Python and PyQt6. Simple on purpose: two folders, one direction, nothing erased.
 
 ---
 
-## What it does
+## How it works
 
-SyncDrive Studio lets you set up **sync tasks** between a source and a target
-folder. Each task has:
+1. Pick your **Main** folder (the original files) and your **Backup** folder.
+2. Press **Analyze** — nothing is changed. You see a list of what would happen.
+3. Review the list and press **Start Backup**. A progress bar and a log show what is happening.
 
-- **A sync mode:**
-  - **One-Way Backup** — copies new/changed files from source → target. Never deletes anything.
-  - **One-Way Mirror** — makes the target an exact copy of the source, including deleting files from the target that were removed from the source.
-  - **Two-Way Sync** — changes on either side get copied to the other, and deletions on one side get propagated to the other (tracked within the current app session).
+**Files only go Main ➜ Backup.** Main is only read.
 
-- **A trigger:**
-  - **Manual** — you click Analyze or Sync Now yourself.
-  - **Interval** — runs automatically every N minutes (with quick presets: 5m/15m/30m/1h/6h/24h).
-  - **On File Change** — watches the source folder in real time (via [watchdog](https://pypi.org/project/watchdog/)) and syncs shortly after a change settles.
-  - **On Drive Connect** — runs when a matching external/USB drive is plugged in.
+| Situation | What happens |
+|---|---|
+| File is new in Main | Copied to Backup |
+| File changed in Main (Main is newer) | New version copied to Backup; the **old Backup version is kept** in `Backup/.backup_versions/<date>/` |
+| File exists only in Backup | **You choose** per file (or all at once): leave it, move it to `Backup/.backup_trash/<date>/`, or copy it to Main |
+| File differs and the Backup copy is **newer or the same date** (a conflict) | **You choose**: keep Main's version, or keep Backup's version. The list shows which side is NEWER / older |
+| File is identical | Nothing |
 
-- **Analyze (Preview)** — shows exactly what a sync *would* do (copies, deletes) without touching any files, so you can check before committing.
+**How files are compared:** different size = changed. Same size and same date = identical.
+Same size but different date = the content (SHA-256) is compared, so a file that was only
+"touched" is not copied again. Every copy can also be verified after writing (on by default).
 
-Jobs are saved automatically (`jobs.json` in the app's config folder) and
-reloaded the next time you open the app. The app also has a system tray icon
-so it can keep watching for changes in the background, and only one instance
-can run at a time — opening it again just brings the existing window to the
-front instead of starting a duplicate.
+**Nothing is erased.** Old versions and trash live inside the Backup folder. Use the
+**Old versions / Trash** buttons to open them and restore anything. Only the **Empty…**
+buttons erase, and only after you confirm (default answer: No).
+
+Extra safety: a backup is refused if a folder can't be fully read, if Main is empty while Backup
+isn't, or if one folder is inside the other. Copies are written to a temp file, verified, then
+moved into place, so a failed copy never damages the existing file.
+
+Settings (your two folders) and a `backup.log` are kept in the app's config folder. Only one
+copy of the app can run at a time.
 
 ---
 
 ## ⚠️ Disclaimer
 
-**This software is provided "AS IS", without warranty of any kind.** File
-sync tools — especially in **Mirror** and **Two-Way Sync** modes — can
-**delete or overwrite files** as part of normal operation. That's the
-intended behavior, not a bug, but it means a misconfigured job (e.g. wrong
-source/target) can cause real data loss.
-
-- **Use Analyze (Preview) before your first live sync on any new job**, so you can see exactly what will happen before it happens.
-- **Keep independent backups of anything important.** Do not rely on this tool as your only backup strategy.
-- The author(s) and contributors accept **no liability** for any data loss, corruption, or other damage resulting from the use of this software. **You use it entirely at your own risk.**
-
-This mirrors the disclaimer already shown in the app's own Setup Wizard on
-first run.
+**This software is provided "AS IS", without warranty of any kind.** The author(s) and
+contributors accept **no liability** for any data loss, corruption, or other damage. **You use it
+entirely at your own risk.** Always keep an independent copy of important data, and use
+**Analyze** before every backup.
 
 ---
 
@@ -60,13 +58,8 @@ launch it will:
    for normal uninstalling).
 2. Ask you to accept the disclaimer above.
 
-If it tells you a real-time watching component (`watchdog`) isn't available,
-see [BUILD.md](./BUILD.md) — that means the `.exe` wasn't built with the
-provided spec file (see below).
-
 **Uninstalling:** use the "Uninstall SyncDrive Studio" shortcut in the Start
-Menu, find it in Windows **Settings → Apps**, or right-click the system tray
-icon and choose **Uninstall SyncDrive Studio...**.
+Menu, or find it in Windows **Settings → Apps**. Uninstalling never touches your Main or Backup folders.
 
 ---
 
@@ -119,24 +112,15 @@ dist\SyncDriveStudio.exe
 ```
 That `.exe` is the finished program — copy it wherever you like and run it.
 
-> ⚠️ Don't build with `python -m PyInstaller main.py` (pointing at `main.py`
-> instead of `syncdrive_studio.spec`) — it skips a setting the `.spec` file
-> adds, and real-time file watching silently won't work in the result. See
-> **[BUILD.md](./BUILD.md)** for why, and how to tell if this happened to you.
-
 **Prefer to just run it without building an .exe?**
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-> ⚠️ **Rebuilding after already running the app once?** SyncDrive Studio
-> minimizes to the system tray instead of fully closing when you click the X.
-> If you see `PermissionError: Access is denied` on `dist\SyncDriveStudio.exe`
-> during a rebuild, the previous build is still running in the background —
-> right-click its icon in the system tray (bottom-right, near the clock) and
-> choose **Exit Completely**, or end `SyncDriveStudio.exe` in Task Manager,
-> then rebuild.
+> ⚠️ **Rebuilding after already running the app once?** If you see
+> `PermissionError: Access is denied` on `dist\SyncDriveStudio.exe`, the old build is still
+> running — close it (or end `SyncDriveStudio.exe` in Task Manager) and rebuild.
 
 ---
 
@@ -144,10 +128,8 @@ python main.py
 
 | File | Purpose |
 |---|---|
-| `main.py` | The PyQt6 application: UI, job management, scheduling, real-time watching, single-instance guard, install/uninstall flow |
-| `engine.py` | The actual sync logic — scans folders, plans copy/delete actions, tracks state for two-way sync |
-| `models.py` | Data models for sync jobs (pydantic) |
-| `drive_detector.py` | Detects external/USB drives connecting, for the "On Drive Connect" trigger |
+| `main.py` | The PyQt6 window, setup wizard, single-instance guard, install/uninstall flow |
+| `engine.py` | Scanning, comparing (size/date/hash), and the safe copy / versions / trash operations |
 | `uninstall.py` | Thin forwarder to the uninstall logic in `main.py`, for anyone running from source |
 | `syncdrive_studio.spec` | PyInstaller build configuration |
 | `requirements.txt` | Python dependencies |
@@ -177,12 +159,3 @@ uses this code from patent claims by its contributors.
 
 Found a bug or have a feature request? Open an issue on GitHub:
 https://github.com/mehregan59/syncdrive-studio/issues
-
-
-## Safety guarantees (deletion)
-
-- SyncDrive **never permanently erases** a file. Every "delete" is a *move* into a `.syncdrive_trash/<date_time>/` folder inside the same folder/drive. Copy a file back out to restore it.
-- Every live sync that includes deletions shows a **confirmation list** first (default answer: *Do NOT delete*).
-- Deletions are **automatically disabled** if a folder cannot be fully read, is missing, or one side is empty while the other has files (e.g. drive not ready).
-- Conflicts (a file that differs on both sides) always open a dialog: choose per file or in bulk.
-- Still: keep an independent backup of important data. Use **Analyze** (dry run) first.

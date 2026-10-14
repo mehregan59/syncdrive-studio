@@ -1,370 +1,360 @@
+"""
+SyncDrive Studio engine — ONE-WAY backup: Main -> Backup.
+
+Safety rules enforced here (not only in the UI):
+  * Main is only READ, except for two actions the user must choose explicitly
+    per file ("copy to Main" for a backup-only file, "keep Backup version" for
+    a conflict). Even then the replaced Main file is first saved in the Backup's
+    versions folder.
+  * Nothing is ever erased. Replaced/old files go to  <Backup>/.backup_versions/<stamp>/
+    and files the user removes go to  <Backup>/.backup_trash/<stamp>/ .
+    The only permanent removals in this module are (a) our own half-written
+    temp files (*.sbtmp) and (b) empty_folder(), which only runs when the user
+    clicks "Empty" and confirms.
+  * New copies are written to a temp name, verified (size, optionally SHA-256)
+    and only then moved into place, so a failed copy never damages the
+    existing file.
+  * If a folder cannot be fully read, or Main looks empty while Backup is not,
+    the plan is refused instead of guessing.
+
+Comparison strategy (fast first, exact only when needed):
+  1. different size                       -> files differ (no hashing needed)
+  2. same size, modified time within 2 s  -> treated as identical
+  3. same size, different modified time   -> SHA-256 of both decides
+     (same content = identical, nothing to do; different = real change)
+"""
 import os
+import time
 import shutil
 import hashlib
-import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Set, Tuple
-from models import SyncJob, SyncMode, ConflictPolicy, SyncAction
+from typing import Callable, Dict, List, Optional, Tuple
+
+VERSIONS_DIR = ".backup_versions"
+TRASH_DIR = ".backup_trash"
+LEGACY_TRASH_DIR = ".syncdrive_trash"
+TEMP_SUFFIX = ".sbtmp"
+MTIME_TOLERANCE = 2.0  # seconds (FAT/exFAT store times with 2 s precision)
+
+EXCLUDED_DIR_NAMES = {
+    "$recycle.bin", "system volume information",
+    VERSIONS_DIR, TRASH_DIR, LEGACY_TRASH_DIR,
+}
+EXCLUDED_FILE_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+EXCLUDED_SUFFIXES = (".tmp", TEMP_SUFFIX)
 
 
-TRASH_DIR_NAME = ".syncdrive_trash"
+@dataclass
+class Item:
+    rel: str
+    main_size: Optional[int] = None
+    main_mtime: Optional[float] = None
+    backup_size: Optional[int] = None
+    backup_mtime: Optional[float] = None
+    note: str = ""
 
 
-class SyncEngine:
-    def __init__(self):
-        # Human-readable safety warnings from the most recent plan_job() call
-        # (e.g. "deletes blocked: target folder could not be fully read").
-        self.last_warnings: List[str] = []
-        # Per-job memory of which relative file paths existed on BOTH sides as of
-        # the last completed (non-dry-run) two-way sync. Without this, plan_job
-        # cannot tell "file is new on one side" apart from "file was deleted on
-        # one side" — both look identical (missing on one side, present on the
-        # other) from a single directory snapshot. That ambiguity is exactly why
-        # deleting a file in a two-way job used to resurrect it from the other
-        # folder instead of deleting it there too.
-        self._known_relpaths: Dict[str, Set[str]] = {}
+@dataclass
+class Plan:
+    main: str
+    backup: str
+    new: List[Item] = field(default_factory=list)          # only on Main -> copy to Backup
+    updates: List[Item] = field(default_factory=list)      # Main newer -> update Backup (old version saved)
+    conflicts: List[Item] = field(default_factory=list)    # differ, Backup NOT older -> user decides
+    backup_only: List[Item] = field(default_factory=list)  # only on Backup -> user decides
+    identical: int = 0
+    hashed: int = 0
+    warnings: List[str] = field(default_factory=list)
+    error: str = ""
 
-    @staticmethod
-    def calculate_file_hash(filepath: Path, chunk_size: int = 65536) -> str:
-        """Calculates SHA-256 hash for precise file integrity checks."""
-        hasher = hashlib.sha256()
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+
+@dataclass
+class Operation:
+    kind: str  # new | update | keep_main | keep_backup | trash | copy_to_main
+    item: Item
+
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+def sha256_of(path: Path, chunk: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def stamp_now() -> str:
+    return time.strftime("%Y-%m-%d_%H%M%S")
+
+
+def check_roots(main: Path, backup: Path) -> str:
+    """Returns an error message, or '' if the pair is acceptable."""
+    if not str(main).strip() or not str(backup).strip():
+        return "Please choose both a Main folder and a Backup folder."
+    if not main.is_dir():
+        return f"Main folder not found or not available: {main}"
+    if not backup.is_dir():
+        return f"Backup folder not found or not available: {backup}"
+    m, b = main.resolve(), backup.resolve()
+    if m == b:
+        return "Main and Backup are the same folder."
+    for a, c, an, cn in ((m, b, "Main", "Backup"), (b, m, "Backup", "Main")):
         try:
-            with open(filepath, 'rb') as f:
-                while chunk := f.read(chunk_size):
-                    hasher.update(chunk)
-            return hasher.hexdigest()
-        except OSError:
-            return ""
+            a.relative_to(c)
+            return f"{an} folder is inside the {cn} folder. Choose two separate folders."
+        except ValueError:
+            pass
+    return ""
 
-    @staticmethod
-    def _resolve_conflict(src_mtime: float, dst_mtime: float, policy: ConflictPolicy) -> str:
-        """Determines transfer direction when a file exists in both source and
-        target. Takes mtimes directly (already known from the single scan) instead
-        of re-stat()'ing the files a third time. Only used as a headless fallback
-        when no conflict_resolver is supplied to plan_job (e.g. programmatic/
-        non-interactive callers) — the interactive GUI path always asks instead."""
-        if policy == ConflictPolicy.SOURCE_WINS:
-            return "COPY_TO_TARGET"
-        elif policy == ConflictPolicy.TARGET_WINS:
-            return "COPY_TO_SOURCE"
-        elif policy == ConflictPolicy.SKIP:
-            return "SKIP"
-        elif policy == ConflictPolicy.KEEP_NEWEST:
-            if src_mtime > dst_mtime + 1.0:
-                return "COPY_TO_TARGET"
-            elif dst_mtime > src_mtime + 1.0:
-                return "COPY_TO_SOURCE"
-            return "SKIP"
-        return "SKIP"
 
-    @staticmethod
-    def _scan_with_stats(root: Path, exclude_patterns: List[str]) -> Dict[str, Tuple[int, float]]:
-        """Compatibility wrapper: returns just the file map."""
-        return SyncEngine._scan_checked(root, exclude_patterns)[0]
-
-    @staticmethod
-    def _scan_checked(root: Path, exclude_patterns: List[str]) -> Tuple[Dict[str, Tuple[int, float]], bool]:
-        """Walks `root` exactly once and returns {relative_posix_path: (size, mtime)}
-        for every file under it.
-
-        Uses os.scandir directly (rather than os.walk + a separate Path.stat()
-        call per file) so each DirEntry's cached metadata is reused instead of
-        issuing a second stat syscall per file — on Windows, DirEntry.stat()
-        is populated from the same directory-listing call that discovered the
-        entry, so this avoids a redundant per-file round trip. That matters a
-        lot on external/USB/network drives, where a fresh stat() per file is a
-        real-latency random-access operation, not a free local call.
-
-        Callers should call this exactly once per root per sync and reuse the
-        result — re-walking the same tree multiple times per sync (as the
-        previous implementation did) is the single biggest avoidable cost for
-        large or slow drives.
-
-        exclude_patterns are checked two ways: as a file-name suffix (so
-        ".tmp" skips individual files), AND as an exact (case-insensitive)
-        directory name — so "$RECYCLE.BIN" or "System Volume Information"
-        skip that entire folder and everything inside it, rather than only
-        filtering files whose own name happens to end with that string. That
-        second check used to be missing entirely: those default patterns are
-        folder names, not file suffixes, so they never matched anything via
-        the file-suffix check, and the scan walked straight into the recycle
-        bin / OS-reserved folders and synced whatever it found there.
-        """
-        result: Dict[str, Tuple[int, float]] = {}
-        # complete=False means some directory/entry could not be read, so the
-        # map may be MISSING files that actually exist. Callers must never
-        # treat "absent from an incomplete scan" as "deleted".
-        complete = True
-        if not root.exists():
+def scan(root: Path, should_stop: Callable[[], bool] = None,
+         progress: Callable[[int], None] = None) -> Tuple[Dict[str, Tuple[int, float]], bool]:
+    """Walks `root` once. Returns ({relpath: (size, mtime)}, complete).
+    complete=False means something could not be read, so the map may be
+    missing files that really exist — callers must not trust 'absent'."""
+    result: Dict[str, Tuple[int, float]] = {}
+    complete = True
+    stack = [str(root)]
+    n = 0
+    while stack:
+        if should_stop and should_stop():
             return result, False
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    try:
+                        name_l = e.name.lower()
+                        if e.is_dir(follow_symlinks=False):
+                            if name_l in EXCLUDED_DIR_NAMES:
+                                continue
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            if name_l in EXCLUDED_FILE_NAMES or name_l.endswith(EXCLUDED_SUFFIXES):
+                                continue
+                            st = e.stat(follow_symlinks=False)
+                            rel = Path(e.path).relative_to(root).as_posix()
+                            result[rel] = (st.st_size, st.st_mtime)
+                            n += 1
+                            if progress and n % 500 == 0:
+                                progress(n)
+                    except OSError:
+                        complete = False
+        except OSError:
+            complete = False
+    if progress:
+        progress(n)
+    return result, complete
 
-        excluded_dir_names = {p.lower() for p in exclude_patterns}
-        excluded_dir_names.add(TRASH_DIR_NAME.lower())
 
-        stack = [str(root)]
-        while stack:
-            current = stack.pop()
+# ----------------------------------------------------------------------------
+# planning
+# ----------------------------------------------------------------------------
+def build_plan(main_str: str, backup_str: str,
+               should_stop: Callable[[], bool] = None,
+               status: Callable[[str], None] = None) -> Plan:
+    say = status or (lambda _m: None)
+    main, backup = Path(main_str), Path(backup_str)
+    plan = Plan(main=main_str, backup=backup_str)
+
+    err = check_roots(main, backup)
+    if err:
+        plan.error = err
+        return plan
+
+    say("Scanning Main...")
+    m_map, m_ok = scan(main, should_stop, lambda n: say(f"Scanning Main... {n:,} files"))
+    if should_stop and should_stop():
+        plan.error = "Cancelled."
+        return plan
+    say("Scanning Backup...")
+    b_map, b_ok = scan(backup, should_stop, lambda n: say(f"Scanning Backup... {n:,} files"))
+    if should_stop and should_stop():
+        plan.error = "Cancelled."
+        return plan
+
+    if not m_ok:
+        plan.error = ("Main folder could not be fully read (drive disconnected, locked, or permission denied). "
+                      "Nothing was changed. Fix the problem and Analyze again.")
+        return plan
+    if not b_ok:
+        plan.error = ("Backup folder could not be fully read (drive disconnected, locked, or permission denied). "
+                      "Nothing was changed. Fix the problem and Analyze again.")
+        return plan
+    if not m_map and b_map:
+        plan.error = ("Main folder is EMPTY but Backup has files. This usually means the wrong folder is selected "
+                      "or the drive is not ready. Refusing to continue — nothing was changed.")
+        return plan
+
+    both = [r for r in m_map if r in b_map]
+    for rel in sorted(r for r in m_map if r not in b_map):
+        s, t = m_map[rel]
+        plan.new.append(Item(rel, main_size=s, main_mtime=t))
+
+    for rel in sorted(both):
+        if should_stop and should_stop():
+            plan.error = "Cancelled."
+            return plan
+        ms, mt = m_map[rel]
+        bs, bt = b_map[rel]
+        it = Item(rel, ms, mt, bs, bt)
+        if ms == bs:
+            if abs(mt - bt) <= MTIME_TOLERANCE:
+                plan.identical += 1
+                continue
+            # same size, different time: only the content can tell.
+            say(f"Comparing content: {rel}")
             try:
-                with os.scandir(current) as it:
-                    for entry in it:
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                if entry.name.lower() in excluded_dir_names:
-                                    continue
-                                stack.append(entry.path)
-                            elif entry.is_file(follow_symlinks=False):
-                                if any(entry.name.endswith(ext) for ext in exclude_patterns):
-                                    continue
-                                st = entry.stat(follow_symlinks=False)
-                                rel = Path(entry.path).relative_to(root).as_posix()
-                                result[rel] = (st.st_size, st.st_mtime)
-                        except OSError:
-                            # Vanished mid-scan, permission denied, broken link, etc.
-                            complete = False
-                            continue
-            except OSError:
-                complete = False
+                same = sha256_of(main / rel) == sha256_of(backup / rel)
+            except OSError as e:
+                plan.warnings.append(f"Could not compare {rel}: {e}")
                 continue
-        return result, complete
-
-    def plan_job(self, job: SyncJob, conflict_resolver=None) -> List[SyncAction]:
-        """Calculates exact execution actions without modifying files (Dry-Run / Plan).
-
-        Each source/target pair is scanned exactly once per side (via
-        _scan_with_stats), and every comparison — missing files, changed files,
-        extra files for Mirror mode, deletions for Two-Way mode — is done
-        in-memory against those two dicts. No path is ever stat()'d or walked
-        more than once during planning.
-
-        conflict_resolver: optional callable(conflicts: list[dict]) -> dict.
-        Called once per source/target pair, with ALL conflicts found for that
-        pair (files present on both sides with different size/mtime) — never
-        per-file, so a caller can offer a single bulk decision alongside
-        per-file overrides instead of being asked once per file. Each conflict
-        dict has: relpath, source_path, target_path, src_size, src_mtime,
-        dst_size, dst_mtime. Must return {relpath: "COPY_TO_TARGET" |
-        "COPY_TO_SOURCE" | "SKIP"} — any relpath not in the returned dict is
-        treated as SKIP. If not provided, falls back to automatically deciding
-        via job.conflict_policy (used for headless/non-interactive callers).
-        """
-        actions: List[SyncAction] = []
-        self.last_warnings = []
-
-        for src_str in job.sources:
-            src_root = Path(src_str)
-            if not src_root.exists():
-                self.last_warnings.append(f"Source folder not found: {src_root}")
+            plan.hashed += 1
+            if same:
+                plan.identical += 1
                 continue
+            it.note = "Same size, different content"
+        else:
+            it.note = "Different size"
 
-            for target_str in job.targets:
-                dst_root = Path(target_str)
-                if not dst_root.exists():
-                    self.last_warnings.append(f"Target folder not found: {dst_root}")
-                    continue
+        if mt > bt + MTIME_TOLERANCE:
+            plan.updates.append(it)       # Main is newer: normal update, old Backup copy is kept in versions
+        else:
+            if bt > mt + MTIME_TOLERANCE:
+                it.note += " · Backup copy is NEWER than Main"
+            else:
+                it.note += " · same date"
+            plan.conflicts.append(it)     # Backup newer/same date but different: user must decide
 
-                src_map, src_ok = self._scan_checked(src_root, job.exclude_patterns)
-                dst_map, dst_ok = self._scan_checked(dst_root, job.exclude_patterns)
+    for rel in sorted(r for r in b_map if r not in m_map):
+        s, t = b_map[rel]
+        plan.backup_only.append(Item(rel, backup_size=s, backup_mtime=t))
 
-                # SAFETY: decide whether deletes may be planned at all for this
-                # pair. A delete is only trustworthy if BOTH scans were complete
-                # and neither side looks wiped (empty while the other is not).
-                allow_deletes = True
-                if not (src_ok and dst_ok):
-                    allow_deletes = False
-                    self.last_warnings.append(
-                        f"Deletes disabled for {src_root} <-> {dst_root}: a folder could not be fully read "
-                        f"(drive disconnected, locked, or permission denied).")
-                elif (not src_map and dst_map) or (src_map and not dst_map):
-                    if job.mode == SyncMode.ONE_WAY_MIRROR or self._known_relpaths.get(job.id):
-                        allow_deletes = False
-                        side = "source" if not src_map else "target"
-                        self.last_warnings.append(
-                            f"Deletes disabled for {src_root} <-> {dst_root}: the {side} folder is EMPTY while the "
-                            f"other has files. Refusing to delete anything.")
+    return plan
 
-                # Files present in source: missing-in-target, or present-but-different.
-                conflicts: List[Dict] = []
-                for rel, (s_size, s_mtime) in src_map.items():
-                    src_file = src_root / rel
-                    dst_file = dst_root / rel
-                    dst_entry = dst_map.get(rel)
 
-                    if dst_entry is None:
-                        actions.append(SyncAction(
-                            action_type="COPY_TO_TARGET",
-                            source_path=str(src_file),
-                            target_path=str(dst_file),
-                            reason="File missing in target"
-                        ))
-                    else:
-                        d_size, d_mtime = dst_entry
-                        if s_size != d_size or abs(s_mtime - d_mtime) > 1.0:
-                            conflicts.append({
-                                "relpath": rel,
-                                "source_path": str(src_file),
-                                "target_path": str(dst_file),
-                                "src_size": s_size,
-                                "src_mtime": s_mtime,
-                                "dst_size": d_size,
-                                "dst_mtime": d_mtime,
-                            })
+# ----------------------------------------------------------------------------
+# execution
+# ----------------------------------------------------------------------------
+def _inside(root: Path, p: Path) -> bool:
+    try:
+        p.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
 
-                if conflicts:
-                    if conflict_resolver is not None:
-                        resolutions = conflict_resolver(conflicts) or {}
-                        reason_text = "Conflict resolved by user"
-                    else:
-                        resolutions = {
-                            c["relpath"]: self._resolve_conflict(c["src_mtime"], c["dst_mtime"], job.conflict_policy)
-                            for c in conflicts
-                        }
-                        reason_text = f"Conflict resolved via policy: {job.conflict_policy.value}"
 
-                    for c in conflicts:
-                        decision = resolutions.get(c["relpath"], "SKIP")
-                        if decision == "SKIP":
-                            continue
-                        actions.append(SyncAction(
-                            action_type=decision,
-                            source_path=c["source_path"],
-                            target_path=c["target_path"],
-                            reason=reason_text
-                        ))
+def _unique(dest: Path) -> Path:
+    if not dest.exists():
+        return dest
+    return dest.with_name(f"{dest.stem}_{int(time.time() * 1000)}{dest.suffix}")
 
-                if job.mode == SyncMode.TWO_WAY_SYNC:
-                    known = self._known_relpaths.get(job.id)
-                    src_keys = set(src_map)
-                    dst_keys = set(dst_map)
 
-                    only_in_target = dst_keys - src_keys
-                    for rel in only_in_target:
-                        dst_file = dst_root / rel
-                        src_file = src_root / rel
-                        if allow_deletes and known is not None and rel in known:
-                            # Existed on both sides before, missing from source now
-                            # -> it was deleted from source. Propagate the delete.
-                            actions.append(SyncAction(
-                                action_type="DELETE_TARGET",
-                                target_path=str(dst_file),
-                                reason="Deleted from source — propagating delete (Two-Way Sync)"
-                            ))
-                        else:
-                            actions.append(SyncAction(
-                                action_type="COPY_TO_SOURCE",
-                                source_path=str(src_file),
-                                target_path=str(dst_file),
-                                reason="File missing in source (Two-Way Sync)"
-                            ))
+def _copy_verified(src: Path, dst: Path, verify: bool) -> Path:
+    """Copies src to a temp file next to dst and verifies it. Returns the temp
+    path; the caller moves it into place. dst itself is untouched."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + TEMP_SUFFIX)
+    try:
+        shutil.copy2(src, tmp)
+        if tmp.stat().st_size != src.stat().st_size:
+            raise OSError("copy verification failed (size mismatch)")
+        if verify and sha256_of(tmp) != sha256_of(src):
+            raise OSError("copy verification failed (content mismatch)")
+    except BaseException:
+        try:
+            tmp.unlink()  # our own temp file only
+        except OSError:
+            pass
+        raise
+    return tmp
 
-                    only_in_source = src_keys - dst_keys
-                    for rel in only_in_source:
-                        src_file = src_root / rel
-                        if allow_deletes and known is not None and rel in known:
-                            # Existed on both sides before, missing from target now
-                            # -> it was deleted from target. Propagate the delete.
-                            actions.append(SyncAction(
-                                action_type="DELETE_SOURCE",
-                                source_path=str(src_file),
-                                reason="Deleted from target — propagating delete (Two-Way Sync)"
-                            ))
-                        # else: already covered above (file present in source,
-                        # missing in target -> COPY_TO_TARGET).
 
-                elif job.mode == SyncMode.ONE_WAY_MIRROR and allow_deletes:
-                    extra_in_target = set(dst_map) - set(src_map)
-                    for rel in extra_in_target:
-                        dst_file = dst_root / rel
-                        actions.append(SyncAction(
-                            action_type="DELETE_TARGET",
-                            target_path=str(dst_file),
-                            reason="Extra file in target (Mirror mode)"
-                        ))
+def _move_aside(path: Path, base: Path, rel: str) -> Path:
+    dest = _unique(base / rel)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(path), str(dest))
+    return dest
 
-        return actions
 
-    def record_post_sync_state(self, job: SyncJob) -> None:
-        """Call after a REAL (non-dry-run) sync completes, for TWO_WAY_SYNC jobs
-        only. Snapshots which relative paths now exist on both sides, so the
-        next plan_job() call can tell new files apart from deletions instead of
-        treating every 'missing on one side' the same way.
+def apply_operation(op: Operation, main: Path, backup: Path, stamp: str, verify: bool = True) -> str:
+    """Performs one operation. Returns a human-readable result line.
+    Raises on failure; the caller logs it and carries on with the next file."""
+    rel = op.item.rel
+    m, b = main / rel, backup / rel
+    versions = backup / VERSIONS_DIR / stamp
+    trash = backup / TRASH_DIR / stamp
 
-        This does its own scan (source and target each walked once) because it
-        runs after execute_job_instance has already finished copying/deleting —
-        the on-disk state has changed since plan_job's scan, so that earlier
-        scan can't be reused here without risking a stale snapshot.
-        """
-        if job.mode != SyncMode.TWO_WAY_SYNC:
-            return
-        combined: Set[str] = set()
-        for src_str in job.sources:
-            src_root = Path(src_str)
-            src_keys = set(self._scan_with_stats(src_root, job.exclude_patterns))
-            for target_str in job.targets:
-                dst_root = Path(target_str)
-                dst_keys = set(self._scan_with_stats(dst_root, job.exclude_patterns))
-                # Only paths present on both sides count as "known" — anything
-                # only on one side didn't successfully sync (e.g. a conflict
-                # skip) and shouldn't be assumed stable yet.
-                combined |= (src_keys & dst_keys)
-        self._known_relpaths[job.id] = combined
+    if not (_inside(main, m) and _inside(backup, b)):
+        raise OSError("path escapes its folder; refused")
 
-    @staticmethod
-    def quarantine_file(path: str, job: SyncJob, stamp: str = None) -> str:
-        """SAFE delete: MOVE the file into <root>/.syncdrive_trash/<stamp>/<relpath>
-        instead of erasing it. Never calls unlink. Returns the new location.
-        Raises on any failure (caller must then skip the delete, never fall back
-        to permanent removal)."""
-        p = Path(path)
-        if not p.exists():
-            return ""
-        stamp = stamp or time.strftime("%Y%m%d_%H%M%S")
-        root = None
-        for r in list(job.sources) + list(job.targets):
-            rp = Path(r)
-            try:
-                p.relative_to(rp)
-                if root is None or len(str(rp)) > len(str(root)):
-                    root = rp
-            except ValueError:
-                continue
-        if root is None:
-            raise OSError(f"{path} is not inside any job folder; refusing to touch it")
-        dest = root / TRASH_DIR_NAME / stamp / p.relative_to(root)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            dest = dest.with_name(f"{dest.stem}_{int(time.time()*1000)}{dest.suffix}")
-        shutil.move(str(p), str(dest))
-        return str(dest)
+    if op.kind == "new":
+        if b.exists():
+            return f"SKIPPED (appeared in Backup meanwhile): {rel}"
+        tmp = _copy_verified(m, b, verify)
+        os.replace(tmp, b)
+        return f"COPIED to Backup: {rel}"
 
-    def execute_job(self, job: SyncJob, dry_run: bool = False, progress_callback=None,
-                    allow_deletes: bool = False) -> List[SyncAction]:
-        """Executes the planned sync operations. Deletes are skipped unless
-        allow_deletes=True, and even then files go to the trash folder."""
-        actions = self.plan_job(job)
-        if dry_run:
-            return actions
+    if op.kind in ("update", "keep_main"):
+        tmp = _copy_verified(m, b, verify)           # new version verified FIRST
+        old = _move_aside(b, versions, rel) if b.exists() else None
+        os.replace(tmp, b)
+        return f"UPDATED in Backup: {rel}" + (f"  (old version kept in {VERSIONS_DIR}/{stamp})" if old else "")
 
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        for action in actions:
-            if action.action_type in ("DELETE_TARGET", "DELETE_SOURCE") and not allow_deletes:
-                continue
-            if action.action_type == "COPY_TO_TARGET":
-                s = Path(action.source_path)
-                d = Path(action.target_path)
-                d.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(s, d)
-            elif action.action_type == "COPY_TO_SOURCE":
-                s = Path(action.source_path)
-                d = Path(action.target_path)
-                s.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(d, s)
-            elif action.action_type == "DELETE_TARGET":
-                self.quarantine_file(action.target_path, job, stamp)
-            elif action.action_type == "DELETE_SOURCE":
-                self.quarantine_file(action.source_path, job, stamp)
+    if op.kind == "keep_backup":
+        # Backup version wins: copy it to Main. Main's current file is saved first.
+        saved = _unique(versions / "_replaced_in_main" / rel)
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(m, saved)
+        if saved.stat().st_size != m.stat().st_size:
+            raise OSError("could not save a safety copy of the Main file; Main left unchanged")
+        tmp = _copy_verified(b, m, verify)
+        os.replace(tmp, m)
+        return (f"MAIN REPLACED with Backup version: {rel}  "
+                f"(Main's old file saved in Backup/{VERSIONS_DIR}/{stamp}/_replaced_in_main)")
 
-            if progress_callback:
-                progress_callback(f"Executed: {action.action_type} -> {action.target_path or action.source_path}")
+    if op.kind == "copy_to_main":
+        if m.exists():
+            return f"SKIPPED (already in Main): {rel}"
+        tmp = _copy_verified(b, m, verify)
+        os.replace(tmp, m)
+        return f"COPIED to Main: {rel}  (Backup copy kept)"
 
-        self.record_post_sync_state(job)
-        return actions
+    if op.kind == "trash":
+        _move_aside(b, trash, rel)
+        return f"MOVED TO BACKUP TRASH: {rel}  -> {TRASH_DIR}/{stamp}"
+
+    raise ValueError(f"unknown operation {op.kind}")
+
+
+def folder_stats(folder: Path) -> Tuple[int, int]:
+    """(file_count, total_bytes) for a versions/trash folder."""
+    n = total = 0
+    if folder.is_dir():
+        for dp, _dn, fn in os.walk(folder):
+            for f in fn:
+                try:
+                    total += os.path.getsize(os.path.join(dp, f))
+                    n += 1
+                except OSError:
+                    pass
+    return n, total
+
+
+def empty_folder(folder: Path, backup_root: Path) -> None:
+    """USER-INITIATED permanent removal of the contents of the versions/trash
+    folder. Refuses any folder that is not exactly one of those two."""
+    if folder.name not in (VERSIONS_DIR, TRASH_DIR) or folder.parent.resolve() != backup_root.resolve():
+        raise OSError("refusing to empty a folder that is not the backup's versions/trash folder")
+    if folder.is_dir():
+        shutil.rmtree(folder)
