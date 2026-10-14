@@ -8,6 +8,7 @@ import subprocess
 import importlib.util
 import multiprocessing
 import pathlib
+import threading
 from datetime import datetime
 from enum import Enum
 from typing import List, Callable
@@ -55,7 +56,7 @@ from PyQt6.QtWidgets import (
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, QMessageBox,
     QProgressBar, QFileDialog, QGroupBox, QRadioButton, QSpinBox, QFrame,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QSplitter, QSystemTrayIcon, QMenu,
-    QStyle, QListWidgetItem
+    QStyle, QListWidgetItem, QTableWidget, QTableWidgetItem
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
 from PyQt6.QtGui import QIcon, QColor, QAction
@@ -857,6 +858,8 @@ class SyncWorker(QThread):
     action_item_signal = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(list)
+    conflict_resolution_needed = pyqtSignal(object)
+    delete_confirmation_needed = pyqtSignal(object)
 
     def __init__(self, engine: SyncEngine, job: SyncJob, dry_run: bool):
         super().__init__()
@@ -868,15 +871,42 @@ class SyncWorker(QThread):
     def stop(self):
         self.stop_requested = True
 
+    def _ask_main_thread(self, signal, payload: dict, default):
+        """Emit a request to the GUI thread and block until it answers."""
+        payload["event"] = threading.Event()
+        payload["result"] = default
+        signal.emit(payload)
+        payload["event"].wait()
+        return payload["result"]
+
+    def _resolve_conflicts_interactively(self, conflicts):
+        return self._ask_main_thread(self.conflict_resolution_needed, {"conflicts": conflicts}, {})
+
     def run(self):
         actions = []
         try:
-            actions = self.engine.plan_job(self.job)
-            total = len(actions)
+            resolver = None if self.dry_run else self._resolve_conflicts_interactively
+            actions = self.engine.plan_job(self.job, conflict_resolver=resolver)
 
+            for w in self.engine.last_warnings:
+                self.progress_update.emit(0, f"🛡️ SAFETY: {w}")
+
+            # SAFETY: deletes never run silently. The user must explicitly
+            # approve them (default = No), and approved deletes only MOVE the
+            # file into <folder>/.syncdrive_trash — nothing is ever erased.
+            deletes = [a for a in actions if a.action_type in ("DELETE_TARGET", "DELETE_SOURCE")]
+            allow_deletes = False
+            if deletes and not self.dry_run:
+                allow_deletes = bool(self._ask_main_thread(
+                    self.delete_confirmation_needed, {"deletes": deletes}, False))
+                if not allow_deletes:
+                    self.progress_update.emit(0, f"🛡️ {len(deletes)} delete(s) NOT approved — skipped. No files were removed.")
+
+            total = len(actions)
             if total == 0:
                 self.progress_update.emit(100, "No pending file changes detected.")
 
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             for idx, action in enumerate(actions, 1):
                 if self.stop_requested:
                     self.progress_update.emit(0, "🛑 Sync operation cancelled by user.")
@@ -899,33 +929,94 @@ class SyncWorker(QThread):
                             d.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(action.source_path, d)
                         elif action.action_type == "COPY_TO_SOURCE":
-                            s = pathlib.Path(action.source_path)
-                            s.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(action.target_path, s)
-                        elif action.action_type == "DELETE_TARGET":
-                            pathlib.Path(action.target_path).unlink(missing_ok=True)
-                        elif action.action_type == "DELETE_SOURCE":
-                            pathlib.Path(action.source_path).unlink(missing_ok=True)
+                            s_ = pathlib.Path(action.source_path)
+                            s_.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(action.target_path, s_)
+                        elif action.action_type in ("DELETE_TARGET", "DELETE_SOURCE"):
+                            if allow_deletes:
+                                victim = action.target_path if action.action_type == "DELETE_TARGET" else action.source_path
+                                moved = self.engine.quarantine_file(victim, self.job, stamp)
+                                msg += f" -> moved to trash: {moved}"
+                            else:
+                                msg = "[SKIPPED DELETE] " + (action.target_path or action.source_path)
                     except Exception as file_err:
-                        # One bad file (locked, permission denied, vanished mid-sync)
-                        # must not kill the whole run or silently stop the app from
-                        # ever reacting to file changes again — log it and keep going.
                         self.progress_update.emit(pct, f"⚠️ Skipped {action.target_path or action.source_path}: {file_err}")
 
                 self.progress_update.emit(pct, msg)
 
             if not self.dry_run:
-                # Snapshot which files now exist on both sides so the NEXT
-                # plan_job() call can tell a deleted file apart from a new one
-                # instead of treating both as "missing on one side, copy it back".
                 self.engine.record_post_sync_state(self.job)
         except Exception as e:
             self.error_signal.emit(str(e))
         finally:
-            # Always emit finished, even on a planning error — on_sync_finished
-            # is what re-enables buttons and runs any queued file-change trigger,
-            # so skipping it here would leave the app stuck after one failure.
             self.finished_signal.emit(actions)
+
+
+class ConflictResolutionDialog(QDialog):
+    """Asks the user how to handle every file that differs on both sides."""
+    CHOICES = [("Keep Source Version", "COPY_TO_TARGET"),
+               ("Keep Target Version", "COPY_TO_SOURCE"),
+               ("Skip This File", "SKIP")]
+
+    def __init__(self, conflicts, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Conflicts — you decide")
+        self.resize(900, 500)
+        self.conflicts = conflicts
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"{len(conflicts)} file(s) differ on both sides. Choose what to keep (nothing is overwritten without your choice; default is Skip):"))
+        self.table = QTableWidget(len(conflicts), 4)
+        self.table.setHorizontalHeaderLabels(["File", "Source (size · modified)", "Target (size · modified)", "Decision"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.combos = []
+        fmt = lambda sz, mt: f"{sz:,} B · {datetime.fromtimestamp(mt).strftime('%Y-%m-%d %H:%M')}"
+        for r, c in enumerate(conflicts):
+            self.table.setItem(r, 0, QTableWidgetItem(c["relpath"]))
+            self.table.setItem(r, 1, QTableWidgetItem(fmt(c["src_size"], c["src_mtime"])))
+            self.table.setItem(r, 2, QTableWidgetItem(fmt(c["dst_size"], c["dst_mtime"])))
+            cb = QComboBox()
+            for label, _ in self.CHOICES:
+                cb.addItem(label)
+            cb.setCurrentIndex(2)
+            self.table.setCellWidget(r, 3, cb)
+            self.combos.append(cb)
+        self.table.setColumnWidth(0, 330); self.table.setColumnWidth(1, 200); self.table.setColumnWidth(2, 200)
+        lay.addWidget(self.table)
+        bulk = QHBoxLayout()
+        for label, idx in (("All: Keep Source", 0), ("All: Keep Target", 1), ("All: Skip", 2)):
+            b = QPushButton(label)
+            b.clicked.connect(lambda _=False, i=idx: [cb.setCurrentIndex(i) for cb in self.combos])
+            bulk.addWidget(b)
+        bulk.addStretch()
+        ok = QPushButton("Apply Decisions"); ok.clicked.connect(self.accept)
+        skip = QPushButton("Skip All"); skip.clicked.connect(self.reject)
+        bulk.addWidget(skip); bulk.addWidget(ok)
+        lay.addLayout(bulk)
+
+    def get_resolutions(self):
+        return {c["relpath"]: self.CHOICES[cb.currentIndex()][1] for c, cb in zip(self.conflicts, self.combos)}
+
+
+class DeleteConfirmationDialog(QDialog):
+    def __init__(self, deletes, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚠️ Confirm deletions")
+        self.resize(760, 460)
+        lay = QVBoxLayout(self)
+        lbl = QLabel(f"<b>{len(deletes)} file(s) will be removed from a folder.</b><br>"
+                     "They are NOT erased: each is moved to a <code>.syncdrive_trash</code> folder inside the same "
+                     "drive/folder so you can restore it. If this list looks wrong, press <b>Do NOT delete</b>.")
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+        lst = QListWidget()
+        for a in deletes:
+            lst.addItem(a.target_path if a.action_type == "DELETE_TARGET" else a.source_path)
+        lay.addWidget(lst)
+        row = QHBoxLayout(); row.addStretch()
+        no = QPushButton("Do NOT delete (recommended)"); no.setDefault(True); no.clicked.connect(self.reject)
+        yes = QPushButton("Move to trash"); yes.clicked.connect(self.accept)
+        row.addWidget(no); row.addWidget(yes)
+        lay.addLayout(row)
 
 
 class ModernJobDialog(QDialog):
@@ -1649,7 +1740,23 @@ class MainWindow(QMainWindow):
         self.worker.action_item_signal.connect(self.add_diff_tree_item)
         self.worker.error_signal.connect(lambda err: QMessageBox.critical(self, "Error", err))
         self.worker.finished_signal.connect(self.on_sync_finished)
+        self.worker.conflict_resolution_needed.connect(self.handle_conflict_resolution)
+        self.worker.delete_confirmation_needed.connect(self.handle_delete_confirmation)
         self.worker.start()
+
+    def handle_conflict_resolution(self, pending):
+        try:
+            dlg = ConflictResolutionDialog(pending["conflicts"], self)
+            pending["result"] = dlg.get_resolutions() if dlg.exec() == QDialog.DialogCode.Accepted else {}
+        finally:
+            pending["event"].set()
+
+    def handle_delete_confirmation(self, pending):
+        try:
+            dlg = DeleteConfirmationDialog(pending["deletes"], self)
+            pending["result"] = dlg.exec() == QDialog.DialogCode.Accepted
+        finally:
+            pending["event"].set()
 
     def _on_worker_progress(self, pct: int, msg: str):
         if self.progress_bar.maximum() == 0:

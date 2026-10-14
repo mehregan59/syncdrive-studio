@@ -177,3 +177,12 @@ uses this code from patent claims by its contributors.
 
 Found a bug or have a feature request? Open an issue on GitHub:
 https://github.com/mehregan59/syncdrive-studio/issues
+
+
+## Safety guarantees (deletion)
+
+- SyncDrive **never permanently erases** a file. Every "delete" is a *move* into a `.syncdrive_trash/<date_time>/` folder inside the same folder/drive. Copy a file back out to restore it.
+- Every live sync that includes deletions shows a **confirmation list** first (default answer: *Do NOT delete*).
+- Deletions are **automatically disabled** if a folder cannot be fully read, is missing, or one side is empty while the other has files (e.g. drive not ready).
+- Conflicts (a file that differs on both sides) always open a dialog: choose per file or in bulk.
+- Still: keep an independent backup of important data. Use **Analyze** (dry run) first.
